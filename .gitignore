@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+*.egg-info/
+
+# Secrets & Sensitive Files
+# -------------------------
+# API 키, 계좌번호 등이 포함된 설정 파일 (절대 올리면 안 됩니다!)
+config/config.yaml
+
+# 자동으로 생성되는 접속 토큰 파일
+.token
+
+# 환경 변수 파일
+.env
+
+# Logs
+# ----
+# 실행 로그가 저장되는 폴더
+logs/
+
+# IDE / Editor Settings
+# ---------------------
+.vscode/
+.idea/
+*.sublime-*
+
+# OS Generated Files
+# ------------------
+.DS_Store
+Thumbs.db
+
+# Data Files (필요시 주석 해제)
+# -------------------------
+# data/*.csv
+# data/*.parquet
+# data/*.db

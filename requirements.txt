@@ -1,0 +1,32 @@
+# --- Core & Web ---
+streamlit
+plotly
+httpx
+websockets
+pydantic
+pydantic-settings
+python-dotenv
+keyring
+PyYAML
+anyio
+
+# --- Data & Analysis ---
+pandas
+numpy
+pandas-ta  # 버전을 명시하지 않아 최신 버전 설치
+pyarrow
+duckdb
+sqlalchemy
+
+# --- Logging & Scheduling ---
+loguru
+rich
+apprise
+schedule
+
+# --- Testing & Code Quality ---
+pytest
+pytest-asyncio
+respx
+ruff
+mypy
