@@ -9,6 +9,7 @@ python-dotenv
 keyring
 PyYAML
 anyio
+nest_asyncio
 
 # --- Data & Analysis ---
 pandas

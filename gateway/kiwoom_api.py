@@ -2,7 +2,7 @@ import httpx
 import asyncio
 import json
 import os
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from datetime import datetime, timedelta
 
 from config.loader import config
@@ -208,4 +208,188 @@ class KiwoomAPI:
       return data
     except Exception as e:
       print(f"❌ [매도 주문 실패] {stock_code} {quantity}주. 오류: {e}")
+      return None
+    
+  async def fetch_order_status(self, order_no: str) -> Optional[Dict]:
+    """
+    주어진 주문 번호의 체결 상태를 조회합니다. (API ID: ka10076)
+    완전히 체결되었을 경우에만 체결 정보를 반환합니다.
+    """
+    url = "/api/dostk/acnt"
+    tr_id = "ka10076"
+    
+    try:
+      # ⚠️ API 문서 상 주문 관련 조회는 is_order=True가 필요할 수 있습니다.
+      # 우선 False로 두고, 문제 발생 시 True로 변경 테스트 필요
+      headers = await self._get_headers(tr_id, is_order=False) 
+      body = {
+        "stk_cd": "",       # 종목코드는 특정하지 않아도 계좌 전체에서 조회 가능
+        "qry_tp": "0",      # 0: 전체
+        "sell_tp": "0",     # 0: 전체
+        "ord_no": order_no, # 조회할 주문번호
+        "stex_tp": "0"      # 0: 통합
+      }
+      
+      res = await self.client.post(f"{self.base_url}{url}", headers=headers, json=body)
+      res.raise_for_status()
+      data = res.json()
+
+      # ▼▼▼ 디버깅 코드 추가 ▼▼▼
+      print("--- API 응답 (ka10076) ---")
+      import json
+      print(json.dumps(data, indent=2, ensure_ascii=False))
+      print("--------------------------")
+      # ▲▲▲ 디버깅 코드 추가 ▲▲▲
+
+      if data.get("return_code") != 0:
+        # ❗수정: self.add_log -> print
+        print(f"❗️ 주문 상태 조회 오류: {data.get('return_msg')}") 
+        return None
+
+      executions = data.get('cntr', [])
+      if not executions:
+        # ❗수정: self.add_log -> print
+        print(f"ℹ️ 주문({order_no})에 대한 체결 내역이 아직 없습니다.") 
+        return {'status': 'PENDING'}
+        
+      # 가장 최근 체결 내역을 기준으로 판단 (API는 보통 최신 내역을 먼저 줍니다)
+      latest_execution = executions[0]
+      unfilled_qty_str = latest_execution.get('oso_qty', '0') # 미체결수량은 문자열일 수 있음
+
+      # 안전하게 정수로 변환 시도
+      try:
+          unfilled_qty = int(unfilled_qty_str)
+      except ValueError:
+          print(f"⚠️ 미체결수량(oso_qty)을 정수로 변환하는데 실패했습니다: '{unfilled_qty_str}'")
+          unfilled_qty = -1 # 오류 값
+
+      # 미체결 수량이 0이면 완전 체결로 간주
+      if unfilled_qty == 0:
+        # ❗수정: self.add_log -> print
+        print(f"✅ 주문({order_no}) 완전 체결 확인.") 
+        
+        # 안전하게 숫자형으로 변환 시도
+        try:
+            executed_qty = int(latest_execution.get('cntr_qty', '0'))
+            executed_price_str = latest_execution.get('cntr_pric', '0.0')
+            # 가격 문자열에서 '+' 또는 '-' 부호 제거 후 float 변환
+            executed_price = float(executed_price_str.replace('+', '').replace('-', '')) 
+        except ValueError:
+             print(f"⚠️ 체결 수량/가격을 숫자로 변환하는데 실패했습니다.")
+             executed_qty = 0
+             executed_price = 0.0
+
+        return {
+          'status': 'FILLED',
+          'order_no': latest_execution.get('ord_no'),
+          'executed_qty': executed_qty,
+          'executed_price': executed_price
+        }
+      else:
+        # ❗수정: self.add_log -> print
+        print(f"⏳ 주문({order_no}) 부분 체결 또는 대기 중 (미체결: {unfilled_qty}주).") 
+        return {'status': 'PENDING'}
+
+    except httpx.HTTPStatusError as e:
+      # HTTP 오류 발생 시 응답 내용 출력
+      error_body = e.response.text
+      print(f"❌ 주문 상태 조회 실패 (HTTP 오류): {e.response.status_code} - {error_body}")
+      return None
+    except Exception as e:
+      print(f"❌ 주문 상태 조회 중 예상치 못한 오류 발생 ({type(e).__name__}): {e}")
+      return None
+    
+  async def fetch_volume_surge_stocks(self, market: str = "000") -> Optional[List[Dict]]:
+    """
+    거래량 급증 종목 리스트를 조회합니다. (API ID: ka10023)
+    """
+    url = "/api/dostk/rkinfo"
+    tr_id = "ka10023"
+    try:
+      headers = await self._get_headers(tr_id)
+      body = {
+          "mrkt_tp": market,      # 000: 전체, 001: 코스피, 101: 코스닥
+          "sort_tp": "2",       # 1: 급증량, 2: 급증률
+          "tm_tp": "2",         # 1: 분, 2: 전일
+          "trde_qty_tp": "100", # 100: 10만주 이상 (조절 가능)
+          "tm": "",             # tm_tp가 2(전일)이면 불필요
+          "stk_cnd": "0",       # 0: 전체조회 (필요시 제외 조건 추가)
+          "pric_tp": "0",       # 0: 전체조회
+          "stex_tp": "3"        # 1: KRX, 2: NXT, 3: 통합
+      }
+      res = await self.client.post(f"{self.base_url}{url}", headers=headers, json=body)
+      res.raise_for_status()
+      data = res.json()
+      if data.get("return_code") == 0:
+        print("✅ 거래량 급증 종목 조회 성공")
+        return data.get("trde_qty_sdnin", []) # 'trde_qty_sdnin' 키 확인
+      else:
+        print(f"❗️ 거래량 급증 종목 조회 오류: {data.get('return_msg')}")
+        return None
+    except Exception as e:
+      print(f"❌ 거래량 급증 종목 조회 중 예상치 못한 오류 발생: {e}")
+      return None
+
+  async def fetch_price_rank_stocks(self, market: str = "000", rank_type: str = "1") -> Optional[List[Dict]]:
+    """
+    등락률 상위 종목 리스트를 조회합니다. (API ID: ka10027)
+    """
+    url = "/api/dostk/rkinfo"
+    tr_id = "ka10027"
+    try:
+      headers = await self._get_headers(tr_id)
+      body = {
+          "mrkt_tp": market,        # 000: 전체, 001: 코스피, 101: 코스닥
+          "sort_tp": rank_type,     # 1: 상승률, 2: 상승폭, 3: 하락률, 4: 하락폭
+          "trde_qty_cnd": "0000",   # 0000: 전체조회 (거래량 조건)
+          "stk_cnd": "14",          # 14: ETF 제외 (필요시 조절)
+          "crd_cnd": "0",           # 0: 전체조회 (신용 조건)
+          "updown_incls": "1",      # 1: 상하한 포함
+          "pric_cnd": "8",          # 8: 1천원 이상 (가격 조건, 조절 가능)
+          "trde_prica_cnd": "100",  # 100: 10억원 이상 (거래대금 조건, 조절 가능)
+          "stex_tp": "3"            # 1: KRX, 2: NXT, 3: 통합
+      }
+      res = await self.client.post(f"{self.base_url}{url}", headers=headers, json=body)
+      res.raise_for_status()
+      data = res.json()
+      if data.get("return_code") == 0:
+        print("✅ 등락률 상위 종목 조회 성공")
+        # [cite_start]API 문서 상 응답 키가 'pred_pre_flu_rt_upper' 임 [cite: 1157]
+        return data.get("pred_pre_flu_rt_upper", []) 
+      else:
+        print(f"❗️ 등락률 상위 종목 조회 오류: {data.get('return_msg')}")
+        return None
+    except Exception as e:
+      print(f"❌ 등락률 상위 종목 조회 중 예상치 못한 오류 발생: {e}")
+      return None
+    
+  async def fetch_multiple_stock_details(self, stock_codes: List[str]) -> Optional[List[Dict]]:
+    """
+    여러 종목의 상세 정보를 한 번에 조회합니다. (API ID: ka10095)
+    """
+    url = "/api/dostk/stkinfo"
+    tr_id = "ka10095"
+    if not stock_codes:
+        return None
+        
+    # 종목 코드 리스트를 '|'로 연결
+    codes_str = "|".join(stock_codes)
+    
+    try:
+      headers = await self._get_headers(tr_id)
+      body = {
+          "stk_cd": codes_str
+      }
+      res = await self.client.post(f"{self.base_url}{url}", headers=headers, json=body)
+      res.raise_for_status()
+      data = res.json()
+      
+      if data.get("return_code") == 0:
+        print(f"✅ 관심 종목({len(stock_codes)}개) 상세 정보 조회 성공")
+        return data.get("atn_stk_infr", []) # 응답 키 'atn_stk_infr' 확인 
+      else:
+        print(f"❗️ 관심 종목 상세 정보 조회 오류: {data.get('return_msg')}")
+        return None
+    except Exception as e:
+      print(f"❌ 관심 종목 상세 정보 조회 중 예상치 못한 오류 발생: {e}")
       return None
