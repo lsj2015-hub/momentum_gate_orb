@@ -15,16 +15,30 @@ class KiwoomAPI:
     """키움증권 REST API 및 WebSocket API와의 비동기 통신을 담당합니다."""
 
     TOKEN_FILE = ".token"
+    # URL 상수 정의
     BASE_URL_PROD = "https://api.kiwoom.com"
     REALTIME_URI_PROD = "wss://api.kiwoom.com:10000/api/dostk/websocket"
+    BASE_URL_MOCK = "https://mockapi.kiwoom.com"
+    REALTIME_URI_MOCK = "wss://mockapi.kiwoom.com:10000/api/dostk/websocket" # 모의투자 WS 주소 추가
 
     def __init__(self):
-        self.base_url = self.BASE_URL_PROD
-        self.realtime_uri = self.REALTIME_URI_PROD
+        # config.is_mock 플래그에 따라 API 정보 설정
+        self.is_mock = config.is_mock
+        if self.is_mock:
+            print("🚀 모의투자 환경으로 설정합니다.")
+            self.base_url = self.BASE_URL_MOCK
+            self.realtime_uri = self.REALTIME_URI_MOCK
+            self.app_key = config.kiwoom.mock_app_key
+            self.app_secret = config.kiwoom.mock_app_secret
+            self.account_no = config.kiwoom.mock_account_no
+        else:
+            print("💰 실전투자 환경으로 설정합니다.")
+            self.base_url = self.BASE_URL_PROD
+            self.realtime_uri = self.REALTIME_URI_PROD
+            self.app_key = config.kiwoom.app_key
+            self.app_secret = config.kiwoom.app_secret
+            self.account_no = config.kiwoom.account_no
 
-        self.app_key = config.kiwoom.app_key
-        self.app_secret = config.kiwoom.app_secret
-        self.account_no = config.kiwoom.account_no
         self._access_token: Optional[str] = None # Bearer 제외 순수 토큰 저장
         self._token_expires_at: Optional[datetime] = None
         self.client = httpx.AsyncClient(timeout=None)
@@ -112,12 +126,14 @@ class KiwoomAPI:
             "authorization": access_token_with_bearer, # Bearer 포함된 토큰 사용
             "appkey": self.app_key,
             "appsecret": self.app_secret,
-            "tr_id": tr_id,
+            # "tr_id": tr_id,       # 기존 코드
+            "api-id": tr_id,      # 수정: 헤더 키 이름을 'api-id'로 변경
         }
         if is_order:
             if not self.account_no: print("❌ 주문 헤더 생성 실패: 계좌번호 없음."); return None
             headers["custtype"] = "P"
-            headers["tr_cont"] = "N"
+            # tr_cont 헤더는 주문 API (kt10000 등)에서만 필요하므로 여기서는 제거하는 것이 좋습니다.
+            # headers["tr_cont"] = "N" # 주문 관련 헤더는 주문 함수에서 개별적으로 추가하는 것을 고려
         return headers
 
     # --- WebSocket 연결 및 관리 ---
@@ -385,29 +401,57 @@ class KiwoomAPI:
         return None
 
     async def fetch_volume_surge_stocks(self, market_type: str = "000") -> List[Dict]:
+        """거래량 급증 종목을 요청합니다. (API ID: ka10023)"""
         url_path = "/api/dostk/rkinfo"; tr_id = "ka10023"
         full_url = f"{self.base_url}{url_path}"
         headers = await self._get_headers(tr_id)
         if not headers: return []
-        body = { "mrkt_tp": market_type, "sort_tp": "2", "tm_tp": "1", "tm": "5",
-                 "trde_qty_tp": "10", "stk_cnd": "0", "pric_tp": "8", "stex_tp": "3" }
+        body = {
+            "mrkt_tp": market_type, # 시장구분 (000: 전체, 001: 코스피, 101: 코스닥)
+            "sort_tp": "2",       # 정렬구분 (1:급증량, 2:급증률, 3:급감량, 4:급감률)
+            "tm_tp": "1",         # 시간구분 (1: 분, 2: 전일)
+            "tm": "5",            # 시간 (분 입력)
+            "trde_qty_tp": "10",  # 거래량구분 (10: 만주 이상) -> '00010'으로 수정 시도해볼 수 있음
+            "stk_cnd": "0",       # 종목조건 (0: 전체조회)
+            "pric_tp": "8",       # 가격구분 (8: 1천원 이상)
+            "stex_tp": "3"        # 거래소구분 (1:KRX, 2:NXT, 3:통합)
+        }
         try:
             print(f"🔍 거래량 급증({market_type}) 요청 URL: {full_url}")
             print(f"🔍 거래량 급증({market_type}) 요청 Body: {body}")
             res = await self.client.post(full_url, headers=headers, json=body)
             res.raise_for_status(); data = res.json()
+
+            # 응답 데이터 키 확인 (실제 응답에 따라 'output1' 또는 'trde_qty_sdnin' 사용)
             result_key = 'trde_qty_sdnin' if 'trde_qty_sdnin' in data else ('output1' if 'output1' in data else None)
+
             if data and result_key and data.get(result_key) and data.get('rt_cd') == '0':
                 print(f"✅ 거래량 급증 ({market_type}) 종목 {len(data[result_key])}건 조회")
                 return data[result_key]
-            else: print(f"⚠️ 거래량 급증({market_type}) 데이터 없음: {data.get('msg1', 'API 응답 없음')}"); return []
+            else:
+                # 데이터 없을 때 응답 전체 출력 (디버깅용)
+                print(f"⚠️ 거래량 급증({market_type}) 데이터 없음: {data.get('msg1', 'API 응답 없음')}")
+                print(f"📄 API Raw Response: {data}") # 전체 응답 출력 추가
+                return []
         except httpx.HTTPStatusError as e:
+            # HTTP 오류 시 응답 상세 내용 출력 (디버깅용)
             error_detail = e.response.text
-            try: error_json = e.response.json(); error_detail = error_json.get('msg1', error_detail)
-            except: pass
+            try:
+                error_json = e.response.json()
+                error_detail = error_json.get('msg1', error_detail)
+                print(f"📄 API Raw Response: {error_json}") # 전체 응답 출력 추가
+            except:
+                 print(f"📄 API Raw Response (text): {e.response.text}")
             print(f"❌ 거래량 급증({market_type}) 조회 오류 (HTTP {e.response.status_code}): {error_detail}")
-        except httpx.RequestError as e: print(f"❌ 거래량 급증({market_type}) 조회 네트워크 오류: {e}")
-        except Exception as e: print(f"❌ 예상치 못한 오류 (fetch_volume_surge_stocks): {e}")
+        except httpx.RequestError as e:
+            # 네트워크 관련 오류
+            print(f"❌ 거래량 급증({market_type}) 조회 네트워크 오류: {e}")
+        except Exception as e:
+            # 기타 예상치 못한 오류
+            print(f"❌ 예상치 못한 오류 (fetch_volume_surge_stocks): {e}")
+            # traceback 출력 추가 (상세 디버깅)
+            import traceback
+            traceback.print_exc()
         return []
 
     async def fetch_multiple_stock_details(self, stock_codes: List[str]) -> List[Dict]:
@@ -522,3 +566,47 @@ class KiwoomAPI:
             return {'return_code': e.response.status_code, 'error': error_text}
         except Exception as e:
             print(f"❌ [주문 취소 오류] 원주문: {order_no}. 오류: {e}"); return {'return_code': -99, 'error': str(e)}
+        
+    async def fetch_account_balance(self) -> Optional[Dict]:
+        """예수금 상세 현황을 요청합니다. (API ID: kt00001)"""
+        url = "/api/dostk/acnt"; tr_id = "kt00001"
+        # _get_headers 에서 자동으로 is_mock 여부에 따라 app_key, app_secret 사용
+        headers = await self._get_headers(tr_id, is_order=True) # 계좌 정보 필요
+        if not headers: return None
+
+        # 계좌번호 분리 (is_mock 여부에 따라 account_no 가 이미 설정됨)
+        account_prefix, account_suffix = (self.account_no.split('-') + [''])[:2] if self.account_no and '-' in self.account_no else (None, None)
+        if not account_prefix or not account_suffix:
+            print("❌ 예수금 조회 실패: 계좌번호 형식 오류."); return None
+
+        body = {
+            "canp_no": account_prefix,
+            "acnm_no": account_suffix,
+            "qry_tp": "2", # 2: 일반조회
+            "acnm_prsc_cd": "01", # 계좌상품코드 (01: 위탁)
+            "pwd_tp_cd": "00" # 비밀번호구분 (00: 없음)
+        }
+        try:
+            print(f"🔍 예수금 조회 요청 Body: {body}")
+            # base_url 은 __init__ 에서 is_mock 에 따라 설정됨
+            res = await self.client.post(f"{self.base_url}{url}", headers=headers, json=body)
+            res.raise_for_status(); data = res.json()
+
+            if data and data.get('output1') and data.get('rt_cd') == '0':
+                balance_info = data['output1']
+                print(f"✅ 예수금 조회 성공: {balance_info.get('ord_alowa', 'N/A')}")
+                return balance_info
+            else:
+                error_msg = data.get('msg1', 'API 응답 없음')
+                print(f"⚠️ 예수금 데이터 없음: {error_msg}")
+                print(f"📄 API Raw Response: {data}")
+                return None
+        except httpx.HTTPStatusError as e:
+            error_text = e.response.text; error_msg = error_text
+            try: error_data = e.response.json(); error_msg = error_data.get('msg1', error_text)
+            except: pass
+            print(f"❌ 예수금 조회 HTTP 오류 {e.response.status_code}: {error_msg}")
+        except Exception as e:
+            print(f"❌ 예수금 조회 오류: {e}")
+            print(traceback.format_exc())
+        return None
