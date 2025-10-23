@@ -14,7 +14,7 @@ nest_asyncio
 # --- Data & Analysis ---
 pandas
 numpy
-pandas-ta  # 버전을 명시하지 않아 최신 버전 설치
+# pandas-ta
 pyarrow
 duckdb
 sqlalchemy

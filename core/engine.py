@@ -1,218 +1,333 @@
-# core/engine.py
-
 import asyncio
-from datetime import datetime
-from typing import Dict, List
+import pandas as pd
+from datetime import datetime, timedelta # timedelta import 확인
+from typing import Dict, List, Optional
+import json # json import 추가
 
+# 설정 로더 import
 from config.loader import config
+# API 게이트웨이 import
 from gateway.kiwoom_api import KiwoomAPI
+# 데이터 처리 및 지표 계산 import
 from data.manager import preprocess_chart_data
 from data.indicators import add_vwap, calculate_orb
+# 전략 관련 import
 from strategy.momentum_orb import check_breakout_signal
 from strategy.risk_manager import manage_position
-from strategy import screener
+from strategy.screener import find_momentum_stocks
 
 class TradingEngine:
-  """
-  전체 트레이딩 로직을 관장하는 핵심 실행 엔진. (UI 연동 및 상태 관리 버전)
-  """
-  def __init__(self, config):
-    self.config = config
-    self.target_stock = "900140" # 엘브이엠씨홀딩스
-    
-    # --- 상태 관리 변수 ---
-    # SEARCHING: 매수 기회 탐색
-    # PENDING_ENTRY: 매수 주문 후 체결 대기
-    # IN_POSITION: 포지션 보유 중 (매도 기회 탐색)
-    # PENDING_EXIT: 매도 주문 후 체결 대기
-    self.position: Dict[str, any] = {
-      'status': 'SEARCHING',
-      'stk_cd': None,
-      'entry_price': 0.0,
-      'size': 0,
-      'order_no': None
-    }
+  """웹소켓 기반 실시간 트레이딩 로직 관장 엔진"""
+  def __init__(self, config_obj):
+    self.config = config_obj
+    self.target_stock: Optional[str] = None
+    self.target_stock_name: Optional[str] = None
+    # status: INITIALIZING, SEARCHING, NO_TARGET, PENDING_ENTRY, IN_POSITION, PENDING_EXIT, KILLED, ERROR
+    self.position: Dict[str, any] = {'status': 'INITIALIZING'}
     self.logs: List[str] = []
-    self.add_log("🤖 트레이딩 엔진 초기화 완료. 매수 기회를 탐색합니다.")
-
-  async def initialize_session(self):
-      """장 시작 시 호출되어 오늘의 대상 종목을 선정합니다."""
-      self.add_log("📈 장 시작! 오늘의 모멘텀 종목을 탐색합니다...")
-      # 종목 선정을 위해 임시 API 인스턴스 사용
-      api = KiwoomAPI()
-      try:
-          # screener 함수 호출 시 API 객체 전달
-          target_code = await screener.find_momentum_stocks(api)
-          if target_code:
-              # Kiwoom API는 종목코드 앞에 'A'를 붙이지 않으므로 제거
-              self.target_stock = target_code.lstrip('A')
-              self.add_log(f"🎯 오늘의 대상 종목 선정: {self.target_stock}")
-              # 필요하다면 종목명 조회 로직 추가
-              # stock_info = await api.fetch_stock_info(self.target_stock)
-              # if stock_info:
-              #     self.add_log(f"   종목명: {stock_info.get('stk_nm')}")
-
-          else:
-              self.add_log("⚠️ 조건에 맞는 모멘텀 종목을 찾지 못했습니다. 오늘은 거래하지 않습니다.")
-              self.target_stock = None # 대상 종목이 없으면 None으로 설정
-      except Exception as e:
-          self.add_log(f"❗️ 종목 선정 중 오류 발생: {e}")
-          self.target_stock = None
-      finally:
-          await api.close() # 임시 API 인스턴스 종료
+    self.api: Optional[KiwoomAPI] = None
+    self._stop_event = asyncio.Event()
+    self.last_tick_time = datetime.now() - timedelta(seconds=61) # 첫 틱 즉시 실행
 
   def add_log(self, message: str):
-    """로그 메시지를 추가하고 화면에 출력합니다."""
     log_msg = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
     print(log_msg)
     self.logs.insert(0, log_msg)
-    if len(self.logs) > 20:
-      self.logs.pop()
+    if len(self.logs) > 100: self.logs.pop()
 
-  async def process_tick(self):
-    """매 틱마다 API 인스턴스를 생성하고 상태에 따라 적절한 로직을 수행합니다."""
-
-    if not self.target_stock:
-      # 대상 종목이 없으면 로그를 남기지 않고 조용히 대기 (선택 사항)
-      # self.add_log("대상 종목 없음. 대기합니다.") 
-      await asyncio.sleep(1) # CPU 사용 방지를 위해 짧게 대기
-      return # 함수 종료
-    
-    self.add_log("... 새로운 틱 처리 시작 ...")
-    
-    api = KiwoomAPI()
+  async def start(self):
+    """엔진 시작 및 메인 루프 실행"""
+    self.api = KiwoomAPI()
+    self.position['status'] = 'INITIALIZING'
+    self.add_log("🚀 엔진 시작...")
     try:
-      status = self.position.get('status')
-      if status == 'SEARCHING':
-        await self._handle_searching_state(api)
-      elif status == 'PENDING_ENTRY':
-        await self._handle_pending_entry_state(api)
-      elif status == 'IN_POSITION':
-        await self._handle_in_position_state(api)
-      elif status == 'PENDING_EXIT':
-        await self._handle_pending_exit_state(api)
+      connected = await self.api.connect_websocket(self.handle_realtime_data)
+      if not connected:
+        self.add_log("❌ 웹소켓 연결 실패. 엔진 시작 불가."); self.position['status'] = 'ERROR'; return
+
+      await self.initialize_session(self.api)
+
+      while not self._stop_event.is_set():
+        current_time = datetime.now()
+        current_status = self.position.get('status')
+
+        # 주기적 작업 (틱 처리)
+        if current_status not in ['INITIALIZING', 'ERROR', 'KILLED', 'NO_TARGET'] and \
+           (current_time - self.last_tick_time).total_seconds() >= 60: # 60초 간격
+            await self.process_tick()
+            self.last_tick_time = current_time
+
+        # 대상 없음 상태에서 재시도
+        elif current_status == 'NO_TARGET' and \
+             (current_time - self.last_tick_time).total_seconds() >= 300: # 5분 간격
+             self.add_log("ℹ️ 대상 종목 없음. 스크리닝 재시도...")
+             await self.initialize_session(self.api)
+             self.last_tick_time = current_time
+
+        await asyncio.sleep(1) # 루프 지연
+
+    except asyncio.CancelledError: self.add_log("ℹ️ 엔진 메인 루프 취소됨.")
+    except Exception as e: self.add_log(f"🚨 엔진 메인 루프 예외: {e}"); self.position['status'] = 'ERROR'
     finally:
-      await api.close()
-    
-    self.add_log(f"현재 상태: {self.position['status']}, 보유 종목: {self.position['stk_cd']}")
+      self.add_log("🛑 엔진 종료 절차 시작...")
+      if self.api: await self.api.close()
+      self.add_log("🛑 엔진 종료 완료.")
 
-  async def _handle_searching_state(self, api: KiwoomAPI):
-    """'SEARCHING' 상태: 매수 신호를 탐색하고 주문을 실행합니다."""
-    self.add_log("상태: SEARCHING - 매수 신호를 탐색합니다.")
-    
-    # 1. 데이터 수집 및 가공
-    raw_data = await api.fetch_minute_chart(self.target_stock, timeframe=1)
-    if not (raw_data and raw_data.get("stk_min_pole_chart_qry")):
-      self.add_log("❗️ 데이터를 가져오지 못했습니다.")
-      return
+  async def stop(self):
+    self.add_log("🛑 엔진 종료 신호 수신..."); self._stop_event.set()
 
-    df = preprocess_chart_data(raw_data["stk_min_pole_chart_qry"])
-    if df is None or df.empty:
-      self.add_log("❗️ 데이터프레임 변환에 실패했습니다.")
-      return
-      
-    # 2. 보조지표 계산 및 신호 확인
-    add_vwap(df)
-    orb_levels = calculate_orb(df, timeframe=config.strategy.orb_timeframe)
-    current_price = df['close'].iloc[-1]
-    self.add_log(f"현재가: {current_price}, ORH: {orb_levels['orh']}, ORL: {orb_levels['orl']}")
-    
-    signal = check_breakout_signal(current_price, orb_levels, config.strategy.breakout_buffer)
-    
-    if signal == "BUY":
-      self.add_log("🔥 매수 신호 포착! 시장가 매수 주문을 실행합니다.")
-      order_result = await api.create_buy_order(self.target_stock, quantity=1) # 예시: 1주 매수
-      
-      if order_result and order_result.get('return_code') == 0:
-        self.position['status'] = 'PENDING_ENTRY'
-        self.position['stk_cd'] = self.target_stock
-        self.position['order_no'] = order_result.get('ord_no')
-        self.add_log(f"➡️ 주문 접수 완료 (주문번호: {self.position['order_no']}). 체결 대기로 전환합니다.")
+  # --- 실시간 데이터 처리 콜백 ---
+  def handle_realtime_data(self, data: Dict):
+    try:
+        header = data.get('header', {})
+        body_str = data.get('body')
+        if not header or not body_str: return # PONG 등 무시
+
+        try: body = json.loads(body_str)
+        except: print(f"⚠️ 실시간 body 파싱 실패: {body_str}"); return
+
+        tr_id = header.get('tr_id')
+        if tr_id == '00': asyncio.create_task(self._process_execution_update(body))
+        elif tr_id == '04': asyncio.create_task(self._process_balance_update(body))
+
+    except Exception as e: print(f"🚨 실시간 데이터 처리 오류(콜백): {e} | 데이터: {data}")
+
+  # --- 실시간 데이터 처리 상세 ---
+  async def _process_execution_update(self, exec_data: Dict):
+    try:
+        # 키움 API 문서(p.416) 기준 필드명 사용
+        order_no = exec_data.get('9203')
+        exec_qty_str = exec_data.get('911'); exec_qty = int(exec_qty_str) if exec_qty_str else 0
+        exec_price_str = exec_data.get('910'); exec_price = 0.0
+        order_status = exec_data.get('913')
+        unfilled_qty_str = exec_data.get('902'); unfilled_qty = int(unfilled_qty_str) if unfilled_qty_str else 0
+        stock_code_raw = exec_data.get('9001')
+        order_type = exec_data.get('905') # +매수, -매도
+
+        if not all([order_no, order_status, stock_code_raw]): return
+        stock_code = stock_code_raw[1:] if stock_code_raw.startswith('A') else stock_code_raw
+        if exec_price_str:
+            try: exec_price = float(exec_price_str.replace('+', '').replace('-', ''))
+            except ValueError: self.add_log(f"⚠️ 체결가 오류: {exec_price_str}"); return
+
+        current_order_no = self.position.get('order_no')
+        if not current_order_no or current_order_no != order_no: return # 관심 주문 아님
+
+        self.add_log(f"⚡️ 주문({order_no}) 상태={order_status}, 종목={stock_code}, 체결량={exec_qty}, 체결가={exec_price}, 미체결량={unfilled_qty}")
+
+        # PENDING_ENTRY: 매수 체결 처리
+        if self.position.get('status') == 'PENDING_ENTRY':
+            if order_status == '체결':
+                filled_qty = self.position.get('filled_qty', 0) + exec_qty
+                filled_value = self.position.get('filled_value', 0) + (exec_qty * exec_price)
+                self.position['filled_qty'] = filled_qty
+                self.position['filled_value'] = filled_value
+
+                if unfilled_qty == 0: # 완전 체결
+                    entry_price = filled_value / filled_qty if filled_qty > 0 else 0
+                    self.position.update({
+                        'status': 'IN_POSITION', 'entry_price': entry_price, 'size': filled_qty,
+                        'entry_time': datetime.now(), 'order_no': None, 'order_qty': None,
+                        'filled_qty': None, 'filled_value': None })
+                    self.add_log(f"✅ (WS) 매수 완전 체결: 진입가={entry_price:.2f}, 수량={filled_qty}")
+                else: self.add_log(f"⏳ (WS) 매수 부분 체결: 누적 {filled_qty}/{self.position.get('order_qty')}")
+
+            elif order_status in ['취소', '거부', '확인']:
+                filled_qty = self.position.get('filled_qty', 0)
+                if filled_qty > 0: # 부분 체결 후 종료
+                     entry_price = self.position.get('filled_value', 0) / filled_qty
+                     self.add_log(f"⚠️ (WS) 매수 주문({order_no}) 부분 체결({filled_qty}) 후 종료({order_status}).")
+                     self.position.update({ 'status': 'IN_POSITION', 'entry_price': entry_price, 'size': filled_qty,
+                                            'entry_time': datetime.now(), 'order_no': None, 'order_qty': None,
+                                            'filled_qty': None, 'filled_value': None })
+                else: # 완전 미체결 후 종료
+                    self.add_log(f"❌ (WS) 매수 주문({order_no}) 실패: {order_status}. SEARCHING 복귀.")
+                    self.position = {'status': 'SEARCHING', 'stk_cd': None}; self.target_stock = None
+
+        # PENDING_EXIT: 매도 체결 처리
+        elif self.position.get('status') == 'PENDING_EXIT':
+             if order_status == '체결':
+                filled_qty = self.position.get('filled_qty', 0) + exec_qty
+                filled_value = self.position.get('filled_value', 0) + (exec_qty * exec_price)
+                self.position['filled_qty'] = filled_qty
+                self.position['filled_value'] = filled_value
+
+                if unfilled_qty == 0: # 완전 체결 (청산 완료)
+                    exit_price = filled_value / filled_qty if filled_qty > 0 else 0
+                    entry_price = self.position.get('entry_price', 0)
+                    profit = (exit_price - entry_price) * filled_qty if entry_price else 0
+                    profit_pct = ((exit_price - entry_price) / entry_price) * 100 if entry_price and entry_price != 0 else 0
+
+                    self.add_log(f"✅ (WS) 매도 완전 체결 (청산): 청산가={exit_price:.2f}, 수량={filled_qty}, 실현손익={profit:.2f} ({profit_pct:.2f}%), 사유={self.position.get('exit_signal')}")
+                    self.position = {'status': 'SEARCHING', 'stk_cd': None}; self.target_stock = None
+                else: self.add_log(f"⏳ (WS) 매도 부분 체결: 누적 {filled_qty}/{self.position.get('order_qty')}")
+
+             elif order_status in ['취소', '거부', '확인']:
+                 filled_qty = self.position.get('filled_qty', 0)
+                 remaining_size = self.position.get('size', 0) - filled_qty
+                 if remaining_size > 0 :
+                      self.add_log(f"⚠️ (WS) 매도 주문({order_no}) 부분 체결({filled_qty}) 후 종료({order_status}). {remaining_size}주 잔여.")
+                      self.position.update({'size': remaining_size, 'status': 'IN_POSITION', 'order_no': None,
+                                           'order_qty': None, 'filled_qty': None, 'filled_value': None})
+                 else: # 전량 미체결 또는 전량 체결 후 종료 상태 수신
+                     if filled_qty == self.position.get('size', 0): # 전량 체결 후 종료 상태 ('확인' 등)
+                         self.add_log(f"ℹ️ (WS) 매도 주문({order_no}) 전량 체결 후 최종 상태({order_status}) 수신. SEARCHING 전환.")
+                         self.position = {'status': 'SEARCHING', 'stk_cd': None}; self.target_stock = None
+                     else: # 전량 미체결 상태에서 종료
+                         self.add_log(f"❌ (WS) 매도 주문({order_no}) 실패: {order_status}. IN_POSITION 복귀.")
+                         self.position.update({'status': 'IN_POSITION', 'order_no': None, 'order_qty': None,
+                                               'filled_qty': None, 'filled_value': None})
+
+    except Exception as e:
+        self.add_log(f"🚨 주문 체결 처리 오류(_process_execution_update): {e} | Data: {exec_data}")
+
+
+  async def _process_balance_update(self, balance_data: Dict):
+      """실시간 잔고(TR ID: 04) 데이터 처리."""
+      try:
+          # 키움 API 문서(p.420) 기준 필드명 사용
+          stock_code_raw = balance_data.get('9001')
+          current_size_str = balance_data.get('930')
+          avg_price_str = balance_data.get('931')
+
+          if not stock_code_raw or current_size_str is None or avg_price_str is None: return
+
+          stock_code = stock_code_raw[1:] if stock_code_raw.startswith('A') else stock_code_raw
+          current_size = int(current_size_str)
+          avg_price = float(avg_price_str)
+
+          # 현재 관리 중인 포지션과 관련된 업데이트인지 확인
+          if self.position.get('stk_cd') == stock_code and self.position.get('status') in ['IN_POSITION', 'PENDING_EXIT']:
+              pos_size = self.position.get('size')
+              # 수량 변경 시 로그 및 업데이트
+              if pos_size is not None and pos_size != current_size:
+                  self.add_log(f"🔄 (WS) 잔고 수량 변경 감지: {stock_code}, {pos_size} -> {current_size}")
+                  self.position['size'] = current_size
+                  # 평단은 잔고 업데이트 시 변경하지 않음 (체결 시점 기준 유지)
+
+              # IN_POSITION 상태에서 잔고가 0이 되면 청산된 것으로 간주
+              if current_size == 0 and self.position.get('status') == 'IN_POSITION':
+                  self.add_log(f"ℹ️ (WS) 잔고 0 확인 ({stock_code}). SEARCHING 상태 전환.")
+                  self.position = {'status': 'SEARCHING', 'stk_cd': None}; self.target_stock = None
+
+          # 상태 불일치 감지 (SEARCHING인데 잔고 발견)
+          elif self.position.get('status') == 'SEARCHING' and stock_code == self.target_stock and current_size > 0:
+               self.add_log(f"⚠️ 엔진 상태(SEARCHING)와 불일치하는 잔고({stock_code}, {current_size}주) 발견. 상태 강제 업데이트.")
+               self.position.update({'status': 'IN_POSITION', 'stk_cd': stock_code, 'size': current_size,
+                                     'entry_price': avg_price, 'entry_time': datetime.now() })
+
+      except Exception as e:
+          self.add_log(f"🚨 잔고 처리 오류(_process_balance_update): {e} | Data: {balance_data}")
+
+
+  # --- 종목 선정 ---
+  async def initialize_session(self, api: KiwoomAPI):
+    """장 시작 또는 재시작 시 거래 대상 종목 선정"""
+    self.add_log("🚀 세션 초기화 및 종목 스크리닝...")
+    try:
+      selected_stock_code = await find_momentum_stocks(api)
+      if selected_stock_code:
+        self.target_stock = selected_stock_code
+        stock_info = await api.fetch_stock_info(self.target_stock)
+        self.target_stock_name = stock_info['stk_nm'] if stock_info and 'stk_nm' in stock_info else None
+        log_name = f"({self.target_stock_name})" if self.target_stock_name else ""
+        self.add_log(f"✅ 대상 종목 선정: {self.target_stock}{log_name}")
+        self.position['status'] = 'SEARCHING'
       else:
-        self.add_log(f"❗️ 주문 접수 실패: {order_result}")
+        self.target_stock = None; self.target_stock_name = None
+        self.position['status'] = 'NO_TARGET'; self.add_log("⚠️ 거래 대상 종목 없음.")
+    except Exception as e:
+      self.add_log(f"🚨 스크리닝 오류: {e}")
+      self.target_stock = None; self.target_stock_name = None; self.position['status'] = 'ERROR'
 
-  async def _handle_pending_entry_state(self, api: KiwoomAPI):
-    """'PENDING_ENTRY' 상태: 매수 주문의 체결 여부를 확인합니다."""
-    order_no = self.position.get('order_no')
-    self.add_log(f"상태: PENDING_ENTRY - 매수 주문({order_no})의 체결을 확인합니다.")
+  # --- 주기적 작업 (진입/청산 조건 확인) ---
+  async def process_tick(self):
+    current_status = self.position.get('status')
+    if current_status not in ['SEARCHING', 'IN_POSITION']: return
+    effective_stk_cd = self.position.get('stk_cd') if current_status == 'IN_POSITION' else self.target_stock
+    if not effective_stk_cd or not self.api : return
 
-    order_status = await api.fetch_order_status(order_no) #
+    try: # API 호출 오류 대비
+        raw_data = await self.api.fetch_minute_chart(effective_stk_cd, timeframe=1)
+        if not (raw_data and raw_data.get("stk_min_pole_chart_qry")): return # 데이터 없으면 조용히 종료
 
-    if order_status and order_status['status'] == 'FILLED':
-      # --- 상태 변경: PENDING_ENTRY -> IN_POSITION ---
-      # API 응답에서 실제 체결된 가격과 수량을 가져옵니다.
-      executed_price = order_status.get('executed_price', 0.0)
-      executed_qty = order_status.get('executed_qty', 0)
+        df = preprocess_chart_data(raw_data["stk_min_pole_chart_qry"])
+        if df is None or df.empty: return
 
-      # 체결 수량이 0보다 클 때만 포지션 진입 처리
-      if executed_qty > 0:
-        self.position['status'] = 'IN_POSITION'
-        self.position['entry_price'] = executed_price
-        self.position['size'] = executed_qty # ❗️API에서 받은 실제 체결 수량으로 업데이트
-        self.position['entry_time'] = datetime.now()
-        self.position['order_no'] = None # 완료된 주문번호 초기화
-        # 로그에 체결 수량 명시
-        self.add_log(f"✅ *** 매수 체결 완료! *** (체결가: {executed_price}, 수량: {executed_qty})")
-        self.add_log(f"➡️ 포지션 진입 완료. 현재 포지션: {self.position}")
-      else:
-        # 체결 수량이 0이면 (오류 등으로) 상태를 다시 Searching으로 돌림
-        self.add_log(f"⚠️ 체결 수량이 0입니다. 주문({order_no}) 확인 필요. 상태를 SEARCHING으로 복귀합니다.")
-        self.position = {
-          'status': 'SEARCHING', 'stk_cd': None, 'entry_price': 0.0,
-          'size': 0, 'order_no': None
-        }
+        add_vwap(df)
+        orb_levels = calculate_orb(df, timeframe=self.config.strategy.orb_timeframe)
+        current_price = df['close'].iloc[-1]
+        current_vwap = df['VWAP'].iloc[-1] if 'VWAP' in df.columns and not pd.isna(df['VWAP'].iloc[-1]) else None
 
-    elif order_status and order_status['status'] == 'PENDING':
-      self.add_log(f"⏳ 주문({order_no})이 아직 체결되지 않았습니다. 대기를 유지합니다.")
-    else:
-      # fetch_order_status가 None을 반환하거나 예상치 못한 status를 반환한 경우
-      self.add_log(f"❗️ 주문({order_no}) 상태를 확인할 수 없습니다. 안전을 위해 상태를 SEARCHING으로 복귀합니다.")
-      self.position = {
-        'status': 'SEARCHING', 'stk_cd': None, 'entry_price': 0.0,
-        'size': 0, 'order_no': None
-      }
+        # --- 상태별 로직 ---
+        if current_status == 'SEARCHING':
+            signal = check_breakout_signal(current_price, orb_levels, self.config.strategy.breakout_buffer)
+            if signal == "BUY":
+                self.add_log(f"🔥 [{effective_stk_cd}] 매수 신호! (현재가 {current_price})")
+                order_quantity = 1 # TODO: 자금 관리
+                if order_quantity > 0:
+                    order_result = await self.api.create_buy_order(effective_stk_cd, quantity=order_quantity)
+                    if order_result and order_result.get('return_code') == 0:
+                        self.position.update({
+                            'status': 'PENDING_ENTRY', 'order_no': order_result.get('ord_no'),
+                            'order_qty': order_quantity, 'order_price': current_price, 'stk_cd': effective_stk_cd,
+                            'filled_qty': 0, 'filled_value': 0.0 }) # 부분 체결 추적 필드 추가
+                        self.add_log(f"➡️ [{effective_stk_cd}] 매수 주문 접수: {order_result.get('ord_no')}")
 
-  async def _handle_in_position_state(self, api: KiwoomAPI):
-    """'IN_POSITION' 상태: 청산 신호를 탐색하고 주문을 실행합니다."""
-    self.add_log(f"상태: IN_POSITION - 보유 종목({self.position['stk_cd']})의 청산을 탐색합니다.")
-    
-    # 1. 현재가 확인
-    raw_data = await api.fetch_minute_chart(self.target_stock, timeframe=1)
-    if not (raw_data and raw_data.get("stk_min_pole_chart_qry")):
-        self.add_log("❗️ 데이터를 가져오지 못했습니다.")
-        return
-    df = preprocess_chart_data(raw_data["stk_min_pole_chart_qry"])
-    if df is None or df.empty:
-        self.add_log("❗️ 데이터프레임 변환에 실패했습니다.")
-        return
-    current_price = df['close'].iloc[-1]
-    
-    # 2. 청산 신호 확인
-    signal = manage_position(self.position, current_price)
-    if signal in ["TAKE_PROFIT", "STOP_LOSS"]:
-      self.add_log(f"🎉 {signal} 조건 충족! 시장가 매도 주문을 실행합니다.")
-      order_result = await api.create_sell_order(self.target_stock, self.position.get('size', 0))
-      
-      if order_result and order_result.get('return_code') == 0:
-        self.position['status'] = 'PENDING_EXIT'
-        self.position['order_no'] = order_result.get('ord_no')
-        self.add_log(f"⬅️ 매도 주문 접수 완료 (주문번호: {self.position['order_no']}). 체결 대기로 전환합니다.")
-      else:
-        self.add_log(f"❗️ 매도 주문 접수 실패: {order_result}")
+        elif current_status == 'IN_POSITION':
+            signal = manage_position(self.position, current_price, current_vwap)
+            if signal:
+                log_prefix = "💰" if signal == "TAKE_PROFIT" else "🛑"
+                self.add_log(f"{log_prefix} 청산 신호({signal})! [{effective_stk_cd}] 매도 주문 실행.")
+                order_quantity = self.position.get('size', 0)
+                if order_quantity > 0:
+                    order_result = await self.api.create_sell_order(effective_stk_cd, quantity=order_quantity)
+                    if order_result and order_result.get('return_code') == 0:
+                        self.position.update({
+                            'status': 'PENDING_EXIT', 'order_no': order_result.get('ord_no'),
+                            'order_qty': order_quantity, 'exit_signal': signal,
+                            'filled_qty': 0, 'filled_value': 0.0 }) # 부분 체결 추적 필드 추가
+                        self.add_log(f"⬅️ [{effective_stk_cd}] 매도 주문 접수: {order_result.get('ord_no')}")
+    except Exception as e:
+        self.add_log(f"🚨 Tick 처리 중 오류 발생 ({effective_stk_cd}): {e}")
 
-  async def _handle_pending_exit_state(self, api: KiwoomAPI):
-    """'PENDING_EXIT' 상태: 매도 주문의 체결 여부를 확인합니다."""
-    order_no = self.position.get('order_no')
-    self.add_log(f"상태: PENDING_EXIT - 매도 주문({order_no})의 체결을 확인합니다.")
-    
-    order_status = await api.fetch_order_status(order_no)
-    
-    if order_status and order_status['status'] == 'FILLED':
-      self.add_log(f"✅ *** 매도 체결 완료! ***")
-      self.add_log(f"⬅️ 포지션 청산 완료. 새로운 매매 기회를 탐색합니다.")
-      self.position = {
-        'status': 'SEARCHING', 'stk_cd': None, 'entry_price': 0.0,
-        'size': 0, 'order_no': None
-      }
-    else:
-      self.add_log(f"⏳ 주문({order_no})이 아직 체결되지 않았습니다. 대기를 유지합니다.")
+
+  # --- Kill Switch ---
+  async def execute_kill_switch(self):
+    self.add_log("🚨 KILL SWITCH 발동!")
+    if not self.api: self.add_log("⚠️ API 객체 없음."); return
+    try:
+        original_status = self.position.get('status')
+        order_no = self.position.get('order_no')
+        stk_cd = self.position.get('stk_cd')
+        order_qty = self.position.get('order_qty', 0)
+        position_size = self.position.get('size', 0)
+
+        # 미체결 주문 취소
+        if original_status in ['PENDING_ENTRY', 'PENDING_EXIT'] and order_no and stk_cd:
+            self.add_log(f"  - 미체결 주문({order_no}) 취소 시도...")
+            cancel_result = await self.api.cancel_order(order_no, stk_cd, 0) # 수량 0: 잔량 전체
+            if cancel_result and cancel_result.get('return_code') == 0: self.add_log(f"  ✅ 주문({order_no}) 취소 성공.")
+            else: self.add_log(f"  ⚠️ 주문({order_no}) 취소 실패/불필요.")
+
+        await asyncio.sleep(1.5) # 취소 처리 및 잔고 반영 대기
+
+        # 최신 잔고 기준 확인 (잔고 업데이트 콜백이 처리했을 수 있음)
+        stk_cd_to_liquidate = self.position.get('stk_cd')
+        qty_to_liquidate = self.position.get('size', 0)
+
+        # 보유 포지션 청산
+        if stk_cd_to_liquidate and qty_to_liquidate > 0:
+             self.add_log(f"  - 보유 포지션({stk_cd_to_liquidate}, {qty_to_liquidate}주) 시장가 청산 시도...")
+             sell_result = await self.api.create_sell_order(stk_cd_to_liquidate, quantity=qty_to_liquidate)
+             if sell_result and sell_result.get('return_code') == 0:
+                 self.add_log(f"  ✅ 시장가 청산 주문 접수 완료: {sell_result.get('ord_no')}")
+             else:
+                 self.add_log(f"  ❌ 시장가 청산 주문 실패: {sell_result}"); self.position['status'] = 'ERROR'; return
+        else: self.add_log("  - 청산할 보유 포지션 없음.")
+
+        self.add_log("  - 엔진 정지(KILLED) 및 루프 종료.")
+        self.position = {'status': 'KILLED'}; self.target_stock = None
+        await self.stop()
+    except Exception as e: self.add_log(f"🚨 Kill Switch 오류: {e}"); self.position['status'] = 'ERROR'
+    finally: self.add_log("🚨 Kill Switch 처리 완료.")

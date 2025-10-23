@@ -129,7 +129,6 @@ class KiwoomAPI:
         pure_token = await self.get_access_token() # Bearer 제외 순수 토큰
         if not pure_token:
             print("❌ 웹소켓 연결 불가: 유효 토큰 없음."); return False
-        # print(f"ℹ️ LOGIN에 사용할 토큰 (앞 10자리): {pure_token[:10]}...") # 성공 확인 후 주석 해제 가능
 
         self.message_handler = handler
         print(f"🛰️ 웹소켓 연결 시도: {self.realtime_uri}")
@@ -143,12 +142,12 @@ class KiwoomAPI:
             # 1. 웹소켓 연결 (헤더 없이)
             self.websocket = await websockets.connect(
                 self.realtime_uri,
-                ping_interval=60, # 라이브러리가 PING 전송
-                ping_timeout=20,  # PONG 응답 대기 시간
+                ping_interval=None,  # 자동 PING 비활성화
+                ping_timeout=None,   # PING 타임아웃 비활성화
                 open_timeout=30,
                 ssl=ssl_context
             )
-            print("✅ 웹소켓 연결 성공! (SSL 검증 비활성화, 헤더 없이 연결)")
+            print("✅ 웹소켓 연결 성공! (SSL 검증 비활성화, 자동 PING 비활성화)")
 
             # 2. LOGIN 메시지 전송
             try:
@@ -187,10 +186,15 @@ class KiwoomAPI:
             # 5. TR 등록 전 잠시 대기
             await asyncio.sleep(1)
 
-            # 6. 실시간 TR 등록 ('00', '04')
-            if not self.account_no:
-                 print("❌ 실시간 TR 등록 실패: 계좌번호 설정 필요"); await self.disconnect_websocket(); return False
-            await self.register_realtime(tr_ids=['00', '04'], tr_keys=[self.account_no, self.account_no])
+            # 6. 실시간 TR 등록은 임시로 비활성화 (메인 기능 테스트 우선)
+            # if self.account_no:
+            #     print("ℹ️ 계좌 관련 실시간 데이터 등록을 시도합니다...")
+            #     # 키움 API의 실제 실시간 코드 사용 (주문체결: '00', 잔고: '04')
+            #     await self.register_realtime(['00', '04'], [self.account_no, self.account_no])
+            # else:
+            #     print("ℹ️ 계좌번호가 없어 실시간 등록을 건너뜁니다.")
+            print("ℹ️ 실시간 등록은 임시로 비활성화되었습니다. (메인 기능 테스트 우선)")
+            
             return True
 
         # --- 연결 실패 처리 ---
@@ -208,7 +212,7 @@ class KiwoomAPI:
         return False
 
     async def _receive_messages(self):
-        """웹소켓 메시지 수신 및 처리 루프 (PING/PONG, 데이터 처리)"""
+        """웹소켓 메시지 수신 및 처리 루프 (PING 응답 없이 처리)"""
         if not self.websocket or not self.websocket.open:
             print("⚠️ 메시지 수신 불가: 웹소켓 연결 안됨."); return
         print("👂 실시간 메시지 수신 대기 중...")
@@ -229,12 +233,10 @@ class KiwoomAPI:
                         print(f"ℹ️ WS 시스템 메시지: [{code}] {msg}")
                         continue
 
-                    # --- 👇 PING 처리 👇 ---
+                    # PING 처리 - 응답하지 않고 무시
                     if trnm == 'PING':
-                        print(">>> PING 수신. PING을 그대로 응답합니다.")
-                        # 'data' (파싱된 dict)가 아닌 'message' (원본 str)를 그대로 전송
-                        await self.send_websocket_request_raw(message) 
-                        continue # PING 처리 후 다음 메시지 대기
+                        print(">>> PING 수신. 응답하지 않고 무시합니다.")
+                        continue # PING에 대해 응답하지 않음
 
                     # LOGIN 응답 (이미 connect_websocket에서 처리됨)
                     if trnm == 'LOGIN': continue
@@ -253,7 +255,7 @@ class KiwoomAPI:
                     if header and body_str:
                         tr_id = header.get('tr_id')
                         tr_type = header.get('tr_type') # 실시간은 '3'
-                        if tr_type == '3' and tr_id in ['00', '04']: # 주문체결, 잔고
+                        if tr_type == '3' and tr_id in ['H0STASP0', 'H0STCNI0']: # 주문체결, 잔고 
                             try:
                                 body_data = json.loads(body_str)
                                 if self.message_handler:
@@ -262,7 +264,11 @@ class KiwoomAPI:
                         else:
                             print(f"ℹ️ 처리되지 않은 실시간 데이터: H:{header} / B:{body_str}")
                     else:
-                        print(f"ℹ️ 알 수 없는 형식의 WS 메시지: {data}") # PONG 오류 등은 여기에 해당
+                        # PONG 관련 메시지는 무시
+                        if trnm == 'PONG':
+                            print(f"ℹ️ PONG 응답 수신 (무시): {data}")
+                        else:
+                            print(f"ℹ️ 알 수 없는 형식의 WS 메시지: {data}")
 
                 except json.JSONDecodeError: print(f"⚠️ WS JSON 파싱 실패: {message[:100]}...")
                 except Exception as e:
@@ -276,7 +282,7 @@ class KiwoomAPI:
         finally: print("🛑 메시지 수신 루프 종료."); self.websocket = None
 
     async def send_websocket_request_raw(self, message: str):
-        """JSON 문자열을 웹소켓으로 직접 전송 (LOGIN, REG, REMOVE 용)""" # PONG 제거
+        """JSON 문자열을 웹소켓으로 직접 전송 (LOGIN, REG, REMOVE 용)"""
         if self.websocket and self.websocket.open:
             try:
                 await self.websocket.send(message)
@@ -286,36 +292,56 @@ class KiwoomAPI:
         else:
             print("⚠️ 웹소켓 미연결, RAW 전송 불가.")
 
-    async def register_realtime(self, tr_ids: list[str], tr_keys: list[str], group_no: str = "1"):
-        """실시간 데이터 구독 ('REG') 메시지 구성 및 전송 (예제 코드 형식 사용)"""
-        print(f"➡️ 실시간 등록 요청 시도: ID(type)={tr_ids}, KEY(item)={tr_keys}")
+    async def register_realtime_account(self, tr_ids: list[str], tr_keys: list[str], group_no: str = "1"):
+        """계좌 관련 실시간 데이터 구독 ('REG') - 키움 API 형식에 맞게 수정"""
+        print(f"➡️ 계좌 실시간 등록 요청 시도: ID={tr_ids}, KEY={tr_keys}")
         if len(tr_ids) != len(tr_keys):
-            print("❌ 실시간 등록 실패: ID(type)와 KEY(item) 개수가 일치하지 않음"); return
+            print("❌ 실시간 등록 실패: tr_id와 tr_key 개수가 일치하지 않음"); return
 
-        # data 리스트 생성 (예제 코드 형식: item/type 사용, 값은 리스트)
+        # 키움 API 실시간 등록 형식에 맞게 수정
         data_list = []
         for tr_id, tr_key in zip(tr_ids, tr_keys):
-            # 00(주문체결), 04(잔고)는 item: [""] 형식 사용 (예제 참조)
-            if tr_id in ['00', '04']:
-                data_list.append({"item": [""], "type": [tr_id]})
-            else:
-                # (기타 종목 기반 TR 등록 시)
-                data_list.append({"item": [tr_key], "type": [tr_id]})
-        
-        # 예: data: [{"item": [""], "type": ["00"]}, {"item": [""], "type": ["04"]}]
+            data_list.append({
+                "tr_id": tr_id,   # 실시간 코드
+                "tr_key": tr_key  # 계좌번호
+            })
 
         request_message = {
             'trnm': 'REG',
             'grp_no': group_no,
-            'refresh': '1', # 기존 구독 유지
-            'data': data_list # ✅ 수정된 데이터 형식 사용
+            'refresh': '1',
+            'data': data_list
+        }
+        request_string = json.dumps(request_message)
+        print(f"➡️ WS REG 요청 전송: {request_string}")
+        await self.send_websocket_request_raw(request_string)
+
+    async def register_realtime(self, tr_ids: list[str], tr_keys: list[str], group_no: str = "1"):
+        """일반적인 실시간 데이터 구독 ('REG') 메시지 구성 및 전송"""
+        print(f"➡️ 실시간 등록 요청 시도: ID(type)={tr_ids}, KEY(item)={tr_keys}")
+        if len(tr_ids) != len(tr_keys):
+            print("❌ 실시간 등록 실패: tr_id(type)와 tr_key(item) 개수가 일치하지 않음"); return
+
+        # 일반적인 실시간 등록 포맷
+        data_list = []
+        for tr_id, tr_key in zip(tr_ids, tr_keys):
+            data_list.append({
+                "item": tr_key,  # 종목코드 등
+                "type": tr_id    # 실시간 타입
+            })
+
+        request_message = {
+            'trnm': 'REG',
+            'grp_no': group_no,
+            'refresh': '1', 
+            'data': data_list
         }
         request_string = json.dumps(request_message)
         print(f"➡️ WS REG 요청 전송: {request_string}")
         await self.send_websocket_request_raw(request_string)
 
     async def unregister_realtime(self, tr_ids: List[str], tr_keys: List[str], group_no: str = "1"):
-        """실시간 데이터 구독 해지 ('REMOVE') 메시지 구성 및 전송 (item/type 형식 시도)"""
+        """실시간 데이터 구독 해지 ('REMOVE') 메시지 구성 및 전송"""
         print(f"➡️ 실시간 해지 요청 시도: ID(type)={tr_ids}, KEY(item)={tr_keys}")
         if len(tr_ids) != len(tr_keys):
             print("❌ 실시간 해지 실패: tr_id(type)와 tr_key(item) 개수가 일치하지 않음"); return
@@ -331,10 +357,6 @@ class KiwoomAPI:
         if self.websocket and self.websocket.open:
             print("🔌 웹소켓 연결 종료 시도...")
             try:
-                # 필요시 REMOVE 요청
-                # if self.account_no:
-                #     await self.unregister_realtime(['00', '04'], [self.account_no, self.account_no])
-                #     await asyncio.sleep(0.5)
                 await self.websocket.close()
             except Exception as e: print(f"⚠️ 웹소켓 종료 중 오류: {e}")
             finally: self.websocket = None; print("🔌 웹소켓 연결 종료 완료.")
@@ -345,7 +367,7 @@ class KiwoomAPI:
             try: await self.client.aclose(); print("🔌 HTTP 클라이언트 세션 종료")
             except Exception as e: print(f"⚠️ HTTP 클라이언트 종료 중 오류: {e}")
 
-    # --- REST API 메서드 (이전과 거의 동일) ---
+    # --- REST API 메서드 ---
     async def fetch_stock_info(self, stock_code: str) -> Optional[Dict]:
         url = "/api/dostk/stkinfo"; tr_id = "ka10001"
         headers = await self._get_headers(tr_id)
@@ -385,29 +407,92 @@ class KiwoomAPI:
         return None
 
     async def fetch_volume_surge_stocks(self, market_type: str = "000") -> List[Dict]:
-        url_path = "/api/dostk/rkinfo"; tr_id = "ka10023"
+        """거래량 급증 종목 조회 - 헤더 및 파라미터 개선"""
+        tr_id = "ka10023"  # 명시적으로 tr_id 설정
+        url_path = "/api/dostk/rkinfo"
         full_url = f"{self.base_url}{url_path}"
+        
+        # 헤더 생성 전에 토큰 확인
+        if not await self.get_access_token():
+            print("❌ 거래량 급증 조회 실패: 유효한 토큰을 얻을 수 없음")
+            return []
+            
         headers = await self._get_headers(tr_id)
-        if not headers: return []
-        body = { "mrkt_tp": market_type, "sort_tp": "2", "tm_tp": "1", "tm": "5",
-                 "trde_qty_tp": "10", "stk_cnd": "0", "pric_tp": "8", "stex_tp": "3" }
+        if not headers: 
+            print("❌ 거래량 급증 조회 실패: 헤더 생성 불가")
+            return []
+        
+        # 헤더 내용 확인 로그 (디버깅용)
+        print(f"🔍 요청 헤더 확인: tr_id={headers.get('tr_id')}, appkey={headers.get('appkey')[:10] if headers.get('appkey') else 'None'}...")
+        
+        # 키움 API 스펙에 맞는 파라미터 설정
+        body = { 
+            "mrkt_tp": market_type,  # 시장 구분
+            "sort_tp": "1",          # 정렬 방식 (1: 급증률)
+            "tm_tp": "0",            # 시간 구분 (0: 당일)
+            "tm": "",                # 시간 (당일일 경우 빈 값)
+            "trde_qty_tp": "01",     # 거래량 구분
+            "stk_cnd": "",           # 종목 조건 (빈 값)
+            "pric_tp": "",           # 가격 조건 (빈 값)
+            "stex_tp": ""            # 거래소 구분 (빈 값)
+        }
+        
         try:
             print(f"🔍 거래량 급증({market_type}) 요청 URL: {full_url}")
             print(f"🔍 거래량 급증({market_type}) 요청 Body: {body}")
+            
             res = await self.client.post(full_url, headers=headers, json=body)
-            res.raise_for_status(); data = res.json()
-            result_key = 'trde_qty_sdnin' if 'trde_qty_sdnin' in data else ('output1' if 'output1' in data else None)
-            if data and result_key and data.get(result_key) and data.get('rt_cd') == '0':
-                print(f"✅ 거래량 급증 ({market_type}) 종목 {len(data[result_key])}건 조회")
-                return data[result_key]
-            else: print(f"⚠️ 거래량 급증({market_type}) 데이터 없음: {data.get('msg1', 'API 응답 없음')}"); return []
+            print(f"📡 HTTP 응답 상태: {res.status_code}")
+            
+            res.raise_for_status()
+            data = res.json()
+            
+            print(f"📊 API 응답 상태: rt_cd={data.get('rt_cd')}, return_code={data.get('return_code')}")
+            print(f"📊 API 응답 메시지: msg1={data.get('msg1')}, return_msg={data.get('return_msg')}")
+            
+            # 성공 조건 확인 (rt_cd 또는 return_code)
+            is_success = (data.get('rt_cd') == '0') or (data.get('return_code') == 0)
+            
+            if is_success:
+                # 다양한 응답 키 확인
+                result_key = None
+                possible_keys = ['output', 'output1', 'trde_qty_sdnin', 'data']
+                for key in possible_keys:
+                    if key in data and data[key]:
+                        result_key = key
+                        break
+                
+                if result_key:
+                    result_data = data[result_key]
+                    if isinstance(result_data, list) and len(result_data) > 0:
+                        print(f"✅ 거래량 급증 ({market_type}) 종목 {len(result_data)}건 조회")
+                        return result_data
+                    else:
+                        print(f"⚠️ 거래량 급증({market_type}) 결과는 있지만 빈 배열")
+                        return []
+                else:
+                    print(f"⚠️ 거래량 급증({market_type}) 응답에서 데이터 키를 찾을 수 없음")
+                    print(f"📋 사용 가능한 키들: {list(data.keys())}")
+                    return []
+            else: 
+                error_msg = data.get('msg1') or data.get('return_msg') or 'API 응답 오류'
+                print(f"⚠️ 거래량 급증({market_type}) API 오류: {error_msg}")
+                print(f"📋 전체 응답: {data}")
+                return []
+                
         except httpx.HTTPStatusError as e:
             error_detail = e.response.text
-            try: error_json = e.response.json(); error_detail = error_json.get('msg1', error_detail)
+            try: 
+                error_json = e.response.json()
+                error_detail = error_json.get('msg1') or error_json.get('return_msg') or error_detail
+                print(f"📋 오류 응답 상세: {error_json}")
             except: pass
             print(f"❌ 거래량 급증({market_type}) 조회 오류 (HTTP {e.response.status_code}): {error_detail}")
-        except httpx.RequestError as e: print(f"❌ 거래량 급증({market_type}) 조회 네트워크 오류: {e}")
-        except Exception as e: print(f"❌ 예상치 못한 오류 (fetch_volume_surge_stocks): {e}")
+        except httpx.RequestError as e: 
+            print(f"❌ 거래량 급증({market_type}) 조회 네트워크 오류: {e}")
+        except Exception as e: 
+            print(f"❌ 예상치 못한 오류 (fetch_volume_surge_stocks): {e}")
+            print(f" traceback: {traceback.format_exc()}")
         return []
 
     async def fetch_multiple_stock_details(self, stock_codes: List[str]) -> List[Dict]:
