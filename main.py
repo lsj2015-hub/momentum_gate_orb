@@ -1,7 +1,7 @@
 import asyncio
-import signal # signal 모듈 임포트
+import signal
 from core.engine import TradingEngine
-from config.loader import config # 설정 로드 (선택적: config 직접 사용 안하면 불필요)
+from config.loader import config
 
 # --- 비동기 메인 함수 ---
 async def main():

@@ -1,3 +1,4 @@
+# kiwoom_api.py
 import httpx
 import asyncio
 import json
@@ -9,20 +10,17 @@ from typing import Optional, Dict, List, Callable
 from datetime import datetime, timedelta
 
 from config.loader import config
-# from data.manager import preprocess_chart_data # 주석 처리
 
 class KiwoomAPI:
     """키움증권 REST API 및 WebSocket API와의 비동기 통신을 담당합니다."""
 
     TOKEN_FILE = ".token"
-    # URL 상수 정의
     BASE_URL_PROD = "https://api.kiwoom.com"
     REALTIME_URI_PROD = "wss://api.kiwoom.com:10000/api/dostk/websocket"
     BASE_URL_MOCK = "https://mockapi.kiwoom.com"
-    REALTIME_URI_MOCK = "wss://mockapi.kiwoom.com:10000/api/dostk/websocket" # 모의투자 WS 주소 추가
+    REALTIME_URI_MOCK = "wss://mockapi.kiwoom.com:10000/api/dostk/websocket"
 
     def __init__(self):
-        # config.is_mock 플래그에 따라 API 정보 설정
         self.is_mock = config.is_mock
         if self.is_mock:
             print("🚀 모의투자 환경으로 설정합니다.")
@@ -39,53 +37,53 @@ class KiwoomAPI:
             self.app_secret = config.kiwoom.app_secret
             self.account_no = config.kiwoom.account_no
 
-        self._access_token: Optional[str] = None # Bearer 제외 순수 토큰 저장
+        self._access_token: Optional[str] = None
         self._token_expires_at: Optional[datetime] = None
         self.client = httpx.AsyncClient(timeout=None)
-
         self.websocket: Optional[websockets.WebSocketClientProtocol] = None
         self.message_handler: Optional[Callable[[Dict], None]] = None
-
         self._load_token_from_file()
 
-    # --- 토큰 관리 ---
+    def add_log(self, message: str):
+        print(f"[{datetime.now().strftime('%H:%M:%S')}][API] {message}")
+
+    # --- 토큰 관리 (기존 코드 유지) ---
     def _load_token_from_file(self):
         if os.path.exists(self.TOKEN_FILE):
             try:
                 with open(self.TOKEN_FILE, 'r') as f:
                     token_data = json.load(f)
-                self._access_token = token_data.get('access_token') # 순수 토큰 로드
+                self._access_token = token_data.get('access_token')
                 expires_str = token_data.get('expires_at')
                 if expires_str:
                     self._token_expires_at = datetime.fromisoformat(expires_str)
                     if self.is_token_valid():
-                        print(f"ℹ️ 저장된 토큰을 불러왔습니다. (만료: {self._token_expires_at})")
+                        self.add_log(f"ℹ️ 저장된 토큰을 불러왔습니다. (만료: {self._token_expires_at})")
                     else:
-                        print(f"⚠️ 저장된 토큰 만료됨 (만료: {self._token_expires_at}).")
+                        self.add_log(f"⚠️ 저장된 토큰 만료됨 (만료: {self._token_expires_at}).")
                         self._access_token = None; self._token_expires_at = None
                 else:
-                    print("⚠️ 토큰 파일에 만료 정보 없음."); self._access_token = None; self._token_expires_at = None
+                    self.add_log("⚠️ 토큰 파일에 만료 정보 없음."); self._access_token = None; self._token_expires_at = None
             except (json.JSONDecodeError, KeyError, ValueError, OSError) as e:
-                print(f"⚠️ 토큰 파일 로드 오류: {e}."); self._access_token = None; self._token_expires_at = None
+                self.add_log(f"⚠️ 토큰 파일 로드 오류: {e}."); self._access_token = None; self._token_expires_at = None
         else:
-            print(f"ℹ️ 토큰 파일({self.TOKEN_FILE}) 없음."); self._access_token = None; self._token_expires_at = None
+            self.add_log(f"ℹ️ 토큰 파일({self.TOKEN_FILE}) 없음."); self._access_token = None; self._token_expires_at = None
 
     def _save_token_to_file(self):
         if self._access_token and self._token_expires_at:
             token_data = {'access_token': self._access_token, 'expires_at': self._token_expires_at.isoformat()}
             try:
                 with open(self.TOKEN_FILE, 'w') as f: json.dump(token_data, f)
-                print(f"💾 새 토큰 저장 완료 (만료: {self._token_expires_at})")
-            except IOError as e: print(f"❌ 토큰 파일 저장 실패: {e}")
+                self.add_log(f"💾 새 토큰 저장 완료 (만료: {self._token_expires_at})")
+            except IOError as e: self.add_log(f"❌ 토큰 파일 저장 실패: {e}")
 
     def is_token_valid(self) -> bool:
         if not self._access_token or not self._token_expires_at: return False
         return datetime.now() + timedelta(minutes=1) < self._token_expires_at
 
     async def get_access_token(self) -> Optional[str]:
-        """httpx(비동기)로 접근 토큰 발급/갱신 (Bearer 제외 순수 토큰 반환)"""
         if self.is_token_valid(): return self._access_token
-        print("ℹ️ 접근 토큰 신규 발급/갱신 시도...")
+        self.add_log("ℹ️ 접근 토큰 신규 발급/갱신 시도...")
         url = f"{self.base_url}/oauth2/token"
         headers = {"Content-Type": "application/json;charset=UTF-8"}
         body = {"grant_type": "client_credentials", "appkey": self.app_key, "secretkey": self.app_secret}
@@ -96,272 +94,291 @@ class KiwoomAPI:
             access_token = data.get("access_token") or data.get("token")
             expires_dt_str = data.get("expires_dt")
             if access_token and expires_dt_str:
-                self._access_token = access_token # 순수 토큰 저장
+                self._access_token = access_token
                 try: self._token_expires_at = datetime.strptime(expires_dt_str, "%Y%m%d%H%M%S")
-                except ValueError: print(f"❌ 만료 시간 형식 오류: {expires_dt_str}"); return None
-                print(f"✅ 접근 토큰 발급/갱신 성공 (만료: {self._token_expires_at})")
-                self._save_token_to_file(); return self._access_token # 순수 토큰 반환
+                except ValueError: self.add_log(f"❌ 만료 시간 형식 오류: {expires_dt_str}"); return None
+                self.add_log(f"✅ 접근 토큰 발급/갱신 성공 (만료: {self._token_expires_at})")
+                self._save_token_to_file(); return self._access_token
             else:
                 error_msg = data.get('error_description') or data.get('return_msg') or data.get('msg1', '알 수 없는 오류')
-                print(f"❌ 토큰 발급 응답 오류: {error_msg} | 응답: {data}")
+                self.add_log(f"❌ 토큰 발급 응답 오류: {error_msg} | 응답: {data}")
                 self._access_token = None; self._token_expires_at = None; return None
         except httpx.HTTPStatusError as e:
             error_text = e.response.text; error_msg = error_text
             try: error_data = e.response.json(); error_msg = error_data.get('error_description') or error_data.get('return_msg') or error_data.get('msg1', error_text)
             except: pass
-            print(f"❌ 접근 토큰 발급 실패 (HTTP {e.response.status_code}): {error_msg}")
+            self.add_log(f"❌ 접근 토큰 발급 실패 (HTTP {e.response.status_code}): {error_msg}")
             self._access_token = None; self._token_expires_at = None; return None
         except Exception as e:
-            print(f"❌ 예상치 못한 오류 (get_access_token): {e}")
+            self.add_log(f"❌ 예상치 못한 오류 (get_access_token): {e}")
             self._access_token = None; self._token_expires_at = None; return None
 
     async def _get_headers(self, tr_id: str, is_order: bool = False) -> Optional[Dict]:
-        """REST API 요청에 필요한 헤더 생성 (Bearer 포함)"""
-        pure_token = await self.get_access_token() # 순수 토큰 받기
-        if not pure_token: print(f"❌ 헤더 생성 실패: 유효 토큰 없음 (tr_id: {tr_id})"); return None
-        access_token_with_bearer = f"Bearer {pure_token}" # Bearer 추가
-
+        pure_token = await self.get_access_token()
+        if not pure_token: self.add_log(f"❌ 헤더 생성 실패: 유효 토큰 없음 (tr_id: {tr_id})"); return None
+        access_token_with_bearer = f"Bearer {pure_token}"
         headers = {
             "Content-Type": "application/json;charset=UTF-8",
-            "authorization": access_token_with_bearer, # Bearer 포함된 토큰 사용
+            "authorization": access_token_with_bearer,
             "appkey": self.app_key,
             "appsecret": self.app_secret,
-            # "tr_id": tr_id,       # 기존 코드
-            "api-id": tr_id,      # 수정: 헤더 키 이름을 'api-id'로 변경
+            "api-id": tr_id,
         }
         if is_order:
-            if not self.account_no: print("❌ 주문 헤더 생성 실패: 계좌번호 없음."); return None
+            if not self.account_no: self.add_log("❌ 주문 헤더 생성 실패: 계좌번호 없음."); return None
             headers["custtype"] = "P"
-            # tr_cont 헤더는 주문 API (kt10000 등)에서만 필요하므로 여기서는 제거하는 것이 좋습니다.
-            # headers["tr_cont"] = "N" # 주문 관련 헤더는 주문 함수에서 개별적으로 추가하는 것을 고려
+            # 주문 TR ID를 기반으로 정확한 헤더를 추가해야 할 수 있습니다.
+            # 예: 주문 API가 'tr_cont' 헤더를 요구한다면 여기서 추가
+            # if tr_id in ["kt10000", "kt10001", "kt10002", "kt10003"]: # 주문 관련 TR ID 목록
+            #    headers["tr_cont"] = "N" # 또는 필요한 값
         return headers
 
     # --- WebSocket 연결 및 관리 ---
     async def connect_websocket(self, handler: Callable[[Dict], None]) -> bool:
         """웹소켓 연결, LOGIN 인증, 실시간 데이터 수신 시작"""
         if self.websocket and self.websocket.open:
-            print("ℹ️ 이미 웹소켓에 연결됨."); return True
+            self.add_log("ℹ️ 이미 웹소켓에 연결됨."); return True
 
-        pure_token = await self.get_access_token() # Bearer 제외 순수 토큰
+        pure_token = await self.get_access_token()
         if not pure_token:
-            print("❌ 웹소켓 연결 불가: 유효 토큰 없음."); return False
-        # print(f"ℹ️ LOGIN에 사용할 토큰 (앞 10자리): {pure_token[:10]}...") # 성공 확인 후 주석 해제 가능
+            self.add_log("❌ 웹소켓 연결 불가: 유효 토큰 없음."); return False
 
         self.message_handler = handler
-        print(f"🛰️ 웹소켓 연결 시도: {self.realtime_uri}")
+        self.add_log(f"🛰️ 웹소켓 연결 시도: {self.realtime_uri}")
 
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
-        print("⚠️ SSL 인증서 검증을 비활성화합니다. (테스트 목적, 보안 주의!)")
+        self.add_log("⚠️ SSL 인증서 검증을 비활성화합니다. (테스트 목적, 보안 주의!)")
+
+        connection_timeout = 60
 
         try:
-            # 1. 웹소켓 연결 (헤더 없이)
+            # --- 수정: extra_headers 제거, ping_interval=None ---
             self.websocket = await websockets.connect(
                 self.realtime_uri,
-                ping_interval=60, # 라이브러리가 PING 전송
-                ping_timeout=20,  # PONG 응답 대기 시간
-                open_timeout=30,
+                ping_interval=None, # 서버 PING에 라이브러리가 자동 PONG 응답하도록 시도
+                ping_timeout=20,    # PONG 응답 대기 시간은 유지
+                open_timeout=connection_timeout,
                 ssl=ssl_context
             )
-            print("✅ 웹소켓 연결 성공! (SSL 검증 비활성화, 헤더 없이 연결)")
+            # --- 수정 끝 ---
+            self.add_log("✅ 웹소켓 연결 성공! (SSL 검증 비활성화)")
 
-            # 2. LOGIN 메시지 전송
+            # LOGIN 처리 (기존과 동일)
             try:
                 login_packet = {'trnm': 'LOGIN', 'token': pure_token}
                 login_request_string = json.dumps(login_packet)
-                print(f"➡️ WS LOGIN 요청 전송: {json.dumps({'trnm': 'LOGIN', 'token': '...' + pure_token[-10:]})}")
+                self.add_log(f"➡️ WS LOGIN 요청 전송: {json.dumps({'trnm': 'LOGIN', 'token': '...' + pure_token[-10:]})}")
                 await self.websocket.send(login_request_string)
-                print("✅ WS LOGIN 요청 전송 완료")
+                self.add_log("✅ WS LOGIN 요청 전송 완료")
 
-                # 3. LOGIN 응답 대기 및 확인
-                print("⏳ WS LOGIN 응답 대기 중...")
+                self.add_log("⏳ WS LOGIN 응답 대기 중...")
                 login_response_str = await asyncio.wait_for(self.websocket.recv(), timeout=10)
-                print(f"📬 WS LOGIN 응답 수신: {login_response_str}")
+                self.add_log(f"📬 WS LOGIN 응답 수신: {login_response_str}")
                 login_response = json.loads(login_response_str)
 
                 if login_response.get('trnm') == 'LOGIN' and login_response.get('return_code') == 0:
-                    print("✅ 웹소켓 LOGIN 성공")
+                    self.add_log("✅ 웹소켓 LOGIN 성공")
                 else:
-                    print(f"❌ 웹소켓 LOGIN 실패: {login_response}")
+                    self.add_log(f"❌ 웹소켓 LOGIN 실패: {login_response}")
                     await self.disconnect_websocket(); return False
 
             except asyncio.TimeoutError:
-                print("❌ WS LOGIN 응답 시간 초과 (10초)")
+                self.add_log("❌ WS LOGIN 응답 시간 초과 (10초)")
                 await self.disconnect_websocket(); return False
             except json.JSONDecodeError:
-                print(f"❌ WS LOGIN 응답 파싱 실패: {login_response_str}")
+                self.add_log(f"❌ WS LOGIN 응답 파싱 실패: {login_response_str}")
                 await self.disconnect_websocket(); return False
             except Exception as login_e:
-                print(f"❌ WS LOGIN 처리 중 오류: {login_e}")
-                print(f" traceback: {traceback.format_exc()}")
+                self.add_log(f"❌ WS LOGIN 처리 중 오류: {login_e}")
+                self.add_log(f" traceback: {traceback.format_exc()}")
                 await self.disconnect_websocket(); return False
 
-            # 4. 메시지 수신 루프 시작
             asyncio.create_task(self._receive_messages())
-
-            # 5. TR 등록 전 잠시 대기
             await asyncio.sleep(1)
 
-            # 6. 실시간 TR 등록 ('00', '04')
+            # --- 수정: TR 등록 시 account_no를 key로 사용 ---
+            # '00', '04' TR은 계좌번호를 item(key)으로 사용해야 할 수 있음 (가이드 확인 필요)
+            # 일단 가이드 예시처럼 ""를 사용, 문제가 되면 계좌번호로 변경
             if not self.account_no:
-                 print("❌ 실시간 TR 등록 실패: 계좌번호 설정 필요"); await self.disconnect_websocket(); return False
-            await self.register_realtime(tr_ids=['00', '04'], tr_keys=[self.account_no, self.account_no])
+                 self.add_log("❌ 실시간 TR 등록 실패: 계좌번호 설정 필요"); await self.disconnect_websocket(); return False
+            await self.register_realtime(tr_ids=['00', '04'], tr_keys=["", ""]) # 키움 가이드대로 item을 "" 로 설정
+            # --- 수정 끝 ---
             return True
 
-        # --- 연결 실패 처리 ---
         except websockets.exceptions.InvalidStatusCode as e:
-            print(f"❌ 웹소켓 연결 실패 (상태 코드 {e.status_code}): {e.headers}. 주소/서버 상태 확인.")
+            self.add_log(f"❌ 웹소켓 연결 실패 (상태 코드 {e.status_code}): {e.headers}. 주소/서버 상태 확인.")
         except asyncio.TimeoutError:
-            print(f'❌ 웹소켓 연결 시간 초과 (30초)')
+            self.add_log(f'❌ 웹소켓 연결 시간 초과 ({connection_timeout}초)')
         except OSError as e:
-             print(f"❌ 웹소켓 연결 OS 오류: {e}")
+             self.add_log(f"❌ 웹소켓 연결 OS 오류: {e}")
         except Exception as e:
-            print(f"❌ 웹소켓 연결 중 예상치 못한 오류: {e}")
-            print(f" traceback: {traceback.format_exc()}")
-        # --- 연결 실패 시 정리 ---
+            self.add_log(f"❌ 웹소켓 연결 중 예상치 못한 오류: {e}")
+            self.add_log(f" traceback: {traceback.format_exc()}")
+
         self.websocket = None
         return False
 
     async def _receive_messages(self):
-        """웹소켓 메시지 수신 및 처리 루프 (PING/PONG, 데이터 처리)"""
+        """웹소켓 메시지 수신 및 처리 루프 (데이터 처리, PONG 자동 처리 기대)"""
         if not self.websocket or not self.websocket.open:
-            print("⚠️ 메시지 수신 불가: 웹소켓 연결 안됨."); return
-        print("👂 실시간 메시지 수신 대기 중...")
+            self.add_log("⚠️ 메시지 수신 불가: 웹소켓 연결 안됨."); return
+        self.add_log("👂 실시간 메시지 수신 대기 중...")
         try:
             async for message in self.websocket:
-                print(f"📬 WS 수신: {message[:200]}{'...' if len(str(message)) > 200 else ''}")
+                # self.add_log(f"📬 WS 수신: {message[:200]}{'...' if len(str(message)) > 200 else ''}") # 너무 많은 로그 방지
 
-                if isinstance(message, bytes): print("ℹ️ Bytes 메시지 수신 (무시)"); continue
-                if not isinstance(message, str) or not message.strip(): print("ℹ️ 비어있는 문자열 메시지 수신 (무시)"); continue
+                if isinstance(message, bytes): continue
+                if not isinstance(message, str) or not message.strip(): continue
 
                 try:
                     data = json.loads(message)
                     trnm = data.get("trnm")
 
-                    # 시스템 메시지
                     if trnm == "SYSTEM":
                         code = data.get("code"); msg = data.get("message")
-                        print(f"ℹ️ WS 시스템 메시지: [{code}] {msg}")
+                        self.add_log(f"ℹ️ WS 시스템 메시지: [{code}] {msg}")
                         continue
 
-                    # --- 👇 PING 처리 👇 ---
-                    if trnm == 'PING':
-                        print(">>> PING 수신. PING을 그대로 응답합니다.")
-                        # 'data' (파싱된 dict)가 아닌 'message' (원본 str)를 그대로 전송
-                        await self.send_websocket_request_raw(message) 
-                        continue # PING 처리 후 다음 메시지 대기
-
-                    # LOGIN 응답 (이미 connect_websocket에서 처리됨)
                     if trnm == 'LOGIN': continue
 
-                    # REG/REMOVE 응답
+                    # --- 👇 수정: REG/REMOVE 응답도 message_handler로 전달 ---
                     if trnm in ['REG', 'REMOVE']:
-                        rt_cd = data.get('return_code')
+                        rt_cd_raw = data.get('return_code')
                         msg = data.get('return_msg', '메시지 없음')
-                        if rt_cd == 0: print(f"✅ WS 응답 ({trnm}): {msg}")
-                        else: print(f"❌ WS 오류 응답 ({trnm}): [{rt_cd}] {msg}")
-                        continue
+                        self.add_log(f"📬 WS 응답 ({trnm}): code={rt_cd_raw}, msg='{msg}'") # 로그 위치 이동 및 내용 확인
 
-                    # 실시간 데이터 (header/body 구조)
-                    header = data.get('header')
-                    body_str = data.get('body')
-                    if header and body_str:
-                        tr_id = header.get('tr_id')
-                        tr_type = header.get('tr_type') # 실시간은 '3'
-                        if tr_type == '3' and tr_id in ['00', '04']: # 주문체결, 잔고
-                            try:
-                                body_data = json.loads(body_str)
-                                if self.message_handler:
-                                    self.message_handler({"header": header, "body": body_data})
-                            except json.JSONDecodeError: print(f"⚠️ 실시간 body 파싱 실패: {body_str}")
+                        # 핸들러가 설정되어 있으면 응답 데이터 전달
+                        if self.message_handler:
+                            # engine.py의 handle_realtime_data가 처리할 수 있도록 데이터 전달
+                            self.message_handler(data) # data 딕셔너리 전체 전달
+                        # continue 제거: 아래 REAL 처리 로직과 분리
+
+                    # --- 👇 수정: REALTIME 데이터 처리 로직 수정 ---
+                    elif trnm == 'REAL':
+                        realtime_data_list = data.get('data')
+                        if isinstance(realtime_data_list, list):
+                            for item_data in realtime_data_list:
+                                data_type = item_data.get('type')
+                                item_code = item_data.get('item')
+                                values = item_data.get('values')
+
+                                if data_type and values and self.message_handler:
+                                    # 핸들러에 필요한 정보만 전달 (가이드 구조에 맞춰)
+                                    self.message_handler({
+                                        "trnm": "REAL", # trnm 명시
+                                        "type": data_type,
+                                        "item": item_code,
+                                        "values": values
+                                    })
+                                else:
+                                    self.add_log(f"⚠️ 실시간 데이터 항목 형식 오류: {item_data}")
                         else:
-                            print(f"ℹ️ 처리되지 않은 실시간 데이터: H:{header} / B:{body_str}")
-                    else:
-                        print(f"ℹ️ 알 수 없는 형식의 WS 메시지: {data}") # PONG 오류 등은 여기에 해당
+                            self.add_log(f"⚠️ 'REAL' 메시지 data 필드 오류: {data}")
+                    # --- 👆 수정 끝 ---
 
-                except json.JSONDecodeError: print(f"⚠️ WS JSON 파싱 실패: {message[:100]}...")
+                    else: # PONG 또는 알 수 없는 trnm
+                        if trnm != 'PONG':
+                             self.add_log(f"ℹ️ 알 수 없는 형식의 WS 메시지 (trnm: {trnm}): {data}")
+
+                except json.JSONDecodeError: self.add_log(f"⚠️ WS JSON 파싱 실패: {message[:100]}...")
                 except Exception as e:
-                    print(f"❌ WS 메시지 처리 중 오류: {e} | Msg: {message[:100]}...")
-                    print(f" traceback: {traceback.format_exc()}")
+                    self.add_log(f"❌ WS 메시지 처리 중 오류: {e} | Msg: {message[:100]}...")
+                    self.add_log(f" traceback: {traceback.format_exc()}")
 
-        except websockets.exceptions.ConnectionClosedOK: print("ℹ️ 웹소켓 정상 종료.")
-        except websockets.exceptions.ConnectionClosedError as e: print(f"❌ 웹소켓 비정상 종료: {e.code} {e.reason}")
-        except asyncio.CancelledError: print("ℹ️ 메시지 수신 태스크 취소됨.")
-        except Exception as e: print(f"❌ WS 수신 루프 오류: {e}")
-        finally: print("🛑 메시지 수신 루프 종료."); self.websocket = None
+        except websockets.exceptions.ConnectionClosedOK: self.add_log("ℹ️ 웹소켓 정상 종료.")
+        except websockets.exceptions.ConnectionClosedError as e: self.add_log(f"❌ 웹소켓 비정상 종료: {e.code} {e.reason}")
+        except asyncio.CancelledError: self.add_log("ℹ️ 메시지 수신 태스크 취소됨.")
+        except Exception as e: self.add_log(f"❌ WS 수신 루프 오류: {e}")
+        finally: self.add_log("🛑 메시지 수신 루프 종료."); self.websocket = None
 
     async def send_websocket_request_raw(self, message: str):
-        """JSON 문자열을 웹소켓으로 직접 전송 (LOGIN, REG, REMOVE 용)""" # PONG 제거
+        """JSON 문자열을 웹소켓으로 직접 전송 (LOGIN, REG, REMOVE, PONG 용도)"""
         if self.websocket and self.websocket.open:
             try:
                 await self.websocket.send(message)
-                # print(f"➡️ WS RAW 전송: {message}")
             except Exception as e:
-                print(f"❌ 웹소켓 RAW 메시지 전송 실패: {e}")
+                self.add_log(f"❌ 웹소켓 RAW 메시지 전송 실패: {e}")
         else:
-            print("⚠️ 웹소켓 미연결, RAW 전송 불가.")
+            self.add_log("⚠️ 웹소켓 미연결, RAW 전송 불가.")
 
     async def register_realtime(self, tr_ids: list[str], tr_keys: list[str], group_no: str = "1"):
-        """실시간 데이터 구독 ('REG') 메시지 구성 및 전송 (예제 코드 형식 사용)"""
-        print(f"➡️ 실시간 등록 요청 시도: ID(type)={tr_ids}, KEY(item)={tr_keys}")
+        """실시간 데이터 구독 ('REG') 메시지 구성 및 전송 (가이드 형식 준수)"""
+        self.add_log(f"➡️ 실시간 등록 요청 시도: ID(type)={tr_ids}, KEY(item)={tr_keys}")
         if len(tr_ids) != len(tr_keys):
-            print("❌ 실시간 등록 실패: ID(type)와 KEY(item) 개수가 일치하지 않음"); return
+            self.add_log("❌ 실시간 등록 실패: ID(type)와 KEY(item) 개수가 일치하지 않음"); return
 
-        # data 리스트 생성 (예제 코드 형식: item/type 사용, 값은 리스트)
-        data_list = []
+        # --- 수정: data 리스트 구성 방식 (가이드 기반) ---
+        # 가이드 예시: data: [{"item": ["005930"], "type": ["0B"]}, {"item": [""], "type": ["00"]}]
+        data_payload = []
+        grouped_items = {} # type별로 item들을 그룹화
+
         for tr_id, tr_key in zip(tr_ids, tr_keys):
-            # 00(주문체결), 04(잔고)는 item: [""] 형식 사용 (예제 참조)
+            # item이 필요없는 TR ('00', '04') 처리
             if tr_id in ['00', '04']:
-                data_list.append({"item": [""], "type": [tr_id]})
+                # 빈 문자열 item을 가진 항목 추가
+                data_payload.append({"item": [""], "type": [tr_id]})
+            # item이 필요한 TR 처리
             else:
-                # (기타 종목 기반 TR 등록 시)
-                data_list.append({"item": [tr_key], "type": [tr_id]})
-        
-        # 예: data: [{"item": [""], "type": ["00"]}, {"item": [""], "type": ["04"]}]
+                if tr_id not in grouped_items:
+                    grouped_items[tr_id] = []
+                if tr_key: # 유효한 key만 추가
+                    grouped_items[tr_id].append(tr_key)
 
-        request_message = {
-            'trnm': 'REG',
-            'grp_no': group_no,
-            'refresh': '1', # 기존 구독 유지
-            'data': data_list # ✅ 수정된 데이터 형식 사용
-        }
+        # 그룹화된 item들을 data_payload에 추가
+        for tr_id, items in grouped_items.items():
+            if items: # item이 하나라도 있을 경우에만 추가
+                data_payload.append({"item": items, "type": [tr_id]})
+        # --- 수정 끝 ---
+
+        if not data_payload:
+            self.add_log("⚠️ 실시간 등록 요청할 유효한 데이터 없음.")
+            return
+
+        request_message = { 'trnm': 'REG', 'grp_no': group_no, 'refresh': '1', 'data': data_payload }
         request_string = json.dumps(request_message)
-        print(f"➡️ WS REG 요청 전송: {request_string}")
+        self.add_log(f"➡️ WS REG 요청 전송: {request_string}")
         await self.send_websocket_request_raw(request_string)
 
     async def unregister_realtime(self, tr_ids: List[str], tr_keys: List[str], group_no: str = "1"):
-        """실시간 데이터 구독 해지 ('REMOVE') 메시지 구성 및 전송 (item/type 형식 시도)"""
-        print(f"➡️ 실시간 해지 요청 시도: ID(type)={tr_ids}, KEY(item)={tr_keys}")
+        """실시간 데이터 구독 해지 ('REMOVE') 메시지 구성 및 전송 (register_realtime과 동일한 로직 적용)"""
+        self.add_log(f"➡️ 실시간 해지 요청 시도: ID(type)={tr_ids}, KEY(item)={tr_keys}")
         if len(tr_ids) != len(tr_keys):
-            print("❌ 실시간 해지 실패: tr_id(type)와 tr_key(item) 개수가 일치하지 않음"); return
+            self.add_log("❌ 실시간 해지 실패: ID(type)와 KEY(item) 개수가 일치하지 않음"); return
 
-        data_list_formatted = [{'item': key, 'type': tid} for tid, key in zip(tr_ids, tr_keys)]
+        # register_realtime과 동일한 data payload 구성 로직 사용
+        data_payload = []
+        grouped_items = {}
+        for tr_id, tr_key in zip(tr_ids, tr_keys):
+            if tr_id in ['00', '04']: data_payload.append({"item": [""], "type": [tr_id]})
+            else:
+                if tr_id not in grouped_items: grouped_items[tr_id] = []
+                if tr_key: grouped_items[tr_id].append(tr_key)
+        for tr_id, items in grouped_items.items():
+            if items: data_payload.append({"item": items, "type": [tr_id]})
 
-        request_message = { 'trnm': 'REMOVE', 'grp_no': group_no, 'data': data_list_formatted }
+        if not data_payload: self.add_log("⚠️ 실시간 해지 요청할 유효한 데이터 없음."); return
+
+        request_message = { 'trnm': 'REMOVE', 'grp_no': group_no, 'data': data_payload }
         request_string = json.dumps(request_message)
-        print(f"➡️ WS REMOVE 요청 전송: {request_string}")
+        self.add_log(f"➡️ WS REMOVE 요청 전송: {request_string}")
         await self.send_websocket_request_raw(request_string)
 
     async def disconnect_websocket(self):
         if self.websocket and self.websocket.open:
-            print("🔌 웹소켓 연결 종료 시도...")
-            try:
-                # 필요시 REMOVE 요청
-                # if self.account_no:
-                #     await self.unregister_realtime(['00', '04'], [self.account_no, self.account_no])
-                #     await asyncio.sleep(0.5)
-                await self.websocket.close()
-            except Exception as e: print(f"⚠️ 웹소켓 종료 중 오류: {e}")
-            finally: self.websocket = None; print("🔌 웹소켓 연결 종료 완료.")
+            self.add_log("🔌 웹소켓 연결 종료 시도...")
+            try: await self.websocket.close()
+            except Exception as e: self.add_log(f"⚠️ 웹소켓 종료 중 오류: {e}")
+            finally: self.websocket = None; self.add_log("🔌 웹소켓 연결 종료 완료.")
 
     async def close(self):
         await self.disconnect_websocket()
         if self.client and not self.client.is_closed:
-            try: await self.client.aclose(); print("🔌 HTTP 클라이언트 세션 종료")
-            except Exception as e: print(f"⚠️ HTTP 클라이언트 종료 중 오류: {e}")
+            try: await self.client.aclose(); self.add_log("🔌 HTTP 클라이언트 세션 종료")
+            except Exception as e: self.add_log(f"⚠️ HTTP 클라이언트 종료 중 오류: {e}")
 
-    # --- REST API 메서드 (이전과 거의 동일) ---
+    # --- REST API 메서드들 (이전 코드 유지) ---
     async def fetch_stock_info(self, stock_code: str) -> Optional[Dict]:
         url = "/api/dostk/stkinfo"; tr_id = "ka10001"
         headers = await self._get_headers(tr_id)
@@ -371,242 +388,228 @@ class KiwoomAPI:
             res = await self.client.post(f"{self.base_url}{url}", headers=headers, json=body)
             res.raise_for_status(); data = res.json()
             if data and data.get('output') and data.get('rt_cd') == '0': return data['output']
-            else: print(f"⚠️ [{stock_code}] 종목 정보 없음: {data.get('msg1', 'API 응답 없음')}"); return None
+            else: self.add_log(f"⚠️ [{stock_code}] 종목 정보 없음: {data.get('msg1', 'API 응답 없음')}"); return None
         except httpx.HTTPStatusError as e:
             error_text = e.response.text; error_msg = error_text
             try: error_data = e.response.json(); error_msg = error_data.get('msg1', error_text)
             except: pass
-            print(f"❌ [{stock_code}] 종목 정보 HTTP 오류 {e.response.status_code}: {error_msg}")
-        except Exception as e: print(f"❌ [{stock_code}] 종목 정보 조회 오류: {e}")
+            self.add_log(f"❌ [{stock_code}] 종목 정보 HTTP 오류 {e.response.status_code}: {error_msg}")
+        except Exception as e: self.add_log(f"❌ [{stock_code}] 종목 정보 조회 오류: {e}")
         return None
 
     async def fetch_minute_chart(self, stock_code: str, timeframe: int = 1) -> Optional[Dict]:
         url = "/api/dostk/chart"; tr_id = "ka10080"
         headers = await self._get_headers(tr_id)
-        if not headers: return None
+        if not headers: self.add_log(f"❌ [{stock_code}] 분봉 헤더 생성 실패."); return None
         body = {"stk_cd": stock_code, "tic_scope": str(timeframe), "upd_stkpc_tp": "0"}
         try:
             res = await self.client.post(f"{self.base_url}{url}", headers=headers, json=body)
             res.raise_for_status(); data = res.json()
+            return_code = data.get('return_code')
+            return_msg = data.get('return_msg', '')
             result_key = 'output2' if 'output2' in data else ('stk_min_pole_chart_qry' if 'stk_min_pole_chart_qry' in data else None)
-            if data and result_key and data.get(result_key) and data.get('rt_cd') == '0':
-                return {'stk_min_pole_chart_qry': data[result_key]}
-            else: print(f"⚠️ [{stock_code}] {timeframe}분봉 데이터 없음: {data.get('msg1', 'API 응답 없음')}"); return None
+            result_data = data.get(result_key) if result_key else None
+            # self.add_log(f"  - [API_MIN_CHART] 응답 코드(return_code) ({stock_code}): {return_code}, 메시지: {return_msg}") # 로그 간소화
+            if (return_code == 0 or return_code == '0') and isinstance(result_data, list):
+                if result_data:
+                     # self.add_log(f"  ✅ [API_MIN_CHART] ({stock_code}) {timeframe}분봉 데이터 {len(result_data)}건 정상 반환") # 로그 간소화
+                     return {'stk_min_pole_chart_qry': result_data, 'return_code': 0} # 성공 시 return_code 포함
+                else:
+                    self.add_log(f"  ⚠️ [API_MIN_CHART] ({stock_code}) {timeframe}분봉 데이터 없음 (API 성공, 빈 리스트)."); return {'return_code': 0, 'stk_min_pole_chart_qry': []} # 성공이지만 데이터 없을 때
+            else:
+                error_msg = return_msg if return_msg else 'API 응답 데이터 없음 또는 형식 오류'
+                self.add_log(f"  ❌ [API_MIN_CHART] ({stock_code}) 처리 실패: {error_msg} (return_code: {return_code})")
+                self.add_log(f"  📄 [API_MIN_CHART] ({stock_code}) 실패 시 응답 일부: {str(data)[:200]}..."); return {'return_code': return_code, 'return_msg': error_msg} # 실패 시 return_code/msg 포함
         except httpx.HTTPStatusError as e:
             error_text = e.response.text; error_msg = error_text
-            try: error_data = e.response.json(); error_msg = error_data.get('msg1', error_text)
+            try: error_json = e.response.json(); error_msg = error_json.get('return_msg', error_text)
             except: pass
-            print(f"❌ [{stock_code}] 분봉 데이터 HTTP 오류 {e.response.status_code}: {error_msg}")
-        except Exception as e: print(f"❌ [{stock_code}] 분봉 데이터 조회 오류: {e}")
-        return None
+            self.add_log(f"❌ [{stock_code}] 분봉 데이터 HTTP 오류 {e.response.status_code}: {error_msg}"); return {'return_code': e.response.status_code, 'return_msg': error_msg}
+        except httpx.RequestError as e: self.add_log(f"❌ [{stock_code}] 분봉 데이터 네트워크 오류: {e}"); return {'return_code': -1, 'return_msg': str(e)}
+        except Exception as e: self.add_log(f"❌ [{stock_code}] 분봉 데이터 조회 중 예상치 못한 오류: {e}"); self.add_log(traceback.format_exc()); return {'return_code': -99, 'return_msg': str(e)}
 
-    async def fetch_volume_surge_stocks(self, market_type: str = "000") -> List[Dict]:
-        """거래량 급증 종목을 요청합니다. (API ID: ka10023)"""
+    async def fetch_volume_surge_rank(self, **kwargs) -> Optional[Dict]:
+        """거래량 급증 종목 랭킹 조회 (API ID: ka10023). 인자는 kwargs로 받음."""
         url_path = "/api/dostk/rkinfo"; tr_id = "ka10023"
         full_url = f"{self.base_url}{url_path}"
         headers = await self._get_headers(tr_id)
-        if not headers: return []
-        body = {
-            "mrkt_tp": market_type, # 시장구분 (000: 전체, 001: 코스피, 101: 코스닥)
-            "sort_tp": "2",       # 정렬구분 (1:급증량, 2:급증률, 3:급감량, 4:급감률)
-            "tm_tp": "1",         # 시간구분 (1: 분, 2: 전일)
-            "tm": "5",            # 시간 (분 입력)
-            "trde_qty_tp": "10",  # 거래량구분 (10: 만주 이상) -> '00010'으로 수정 시도해볼 수 있음
-            "stk_cnd": "0",       # 종목조건 (0: 전체조회)
-            "pric_tp": "8",       # 가격구분 (8: 1천원 이상)
-            "stex_tp": "3"        # 거래소구분 (1:KRX, 2:NXT, 3:통합)
+        if not headers: return {'return_code': -1, 'return_msg': '헤더 생성 실패'}
+
+        # 기본 파라미터 설정 및 kwargs로 오버라이드
+        default_params = {
+            'mrkt_tp': '000', 'sort_tp': '2', 'tm_tp': '1', 'tm': '5',
+            'trde_qty_tp': '10', 'stk_cnd': '14', 'pric_tp': '8', 'stex_tp': '3'
         }
+        body = {**default_params, **kwargs} # kwargs로 기본값 덮어쓰기
+
         try:
-            print(f"🔍 거래량 급증({market_type}) 요청 URL: {full_url}")
-            print(f"🔍 거래량 급증({market_type}) 요청 Body: {body}")
+            self.add_log(f"🔍 [API {tr_id}] 거래량 급증 요청 Body: {body}")
             res = await self.client.post(full_url, headers=headers, json=body)
             res.raise_for_status(); data = res.json()
+            # self.add_log(f"📄 [API {tr_id}] 거래량 급증 응답: {str(data)[:200]}...") # 로그 간소화
 
-            # 응답 데이터 키 확인 (실제 응답에 따라 'output1' 또는 'trde_qty_sdnin' 사용)
-            result_key = 'trde_qty_sdnin' if 'trde_qty_sdnin' in data else ('output1' if 'output1' in data else None)
+            return_code = data.get('return_code')
+            return_msg = data.get('return_msg', '')
 
-            if data and result_key and data.get(result_key) and data.get('rt_cd') == '0':
-                print(f"✅ 거래량 급증 ({market_type}) 종목 {len(data[result_key])}건 조회")
-                return data[result_key]
+            if return_code == 0 or return_code == '0':
+                # self.add_log(f"✅ [API {tr_id}] 거래량 급증 조회 성공") # 로그 간소화
+                return data # 전체 응답 반환 (결과 키 포함)
             else:
-                # 데이터 없을 때 응답 전체 출력 (디버깅용)
-                print(f"⚠️ 거래량 급증({market_type}) 데이터 없음: {data.get('msg1', 'API 응답 없음')}")
-                print(f"📄 API Raw Response: {data}") # 전체 응답 출력 추가
-                return []
+                self.add_log(f"⚠️ [API {tr_id}] 거래량 급증 데이터 없음: {return_msg} (return_code: {return_code})")
+                self.add_log(f"📄 API Raw Response: {data}")
+                return {'return_code': return_code, 'return_msg': return_msg} # 실패 정보 반환
         except httpx.HTTPStatusError as e:
-            # HTTP 오류 시 응답 상세 내용 출력 (디버깅용)
-            error_detail = e.response.text
-            try:
-                error_json = e.response.json()
-                error_detail = error_json.get('msg1', error_detail)
-                print(f"📄 API Raw Response: {error_json}") # 전체 응답 출력 추가
-            except:
-                 print(f"📄 API Raw Response (text): {e.response.text}")
-            print(f"❌ 거래량 급증({market_type}) 조회 오류 (HTTP {e.response.status_code}): {error_detail}")
+            error_text = e.response.text; error_msg = error_text
+            try: error_json = e.response.json(); error_msg = error_json.get('return_msg', error_text)
+            except: pass
+            self.add_log(f"❌ [API {tr_id}] 거래량 급증 오류 (HTTP {e.response.status_code}): {error_msg}")
+            return {'return_code': e.response.status_code, 'return_msg': error_msg}
         except httpx.RequestError as e:
-            # 네트워크 관련 오류
-            print(f"❌ 거래량 급증({market_type}) 조회 네트워크 오류: {e}")
+            self.add_log(f"❌ [API {tr_id}] 거래량 급증 네트워크 오류: {e}")
+            return {'return_code': -1, 'return_msg': str(e)}
         except Exception as e:
-            # 기타 예상치 못한 오류
-            print(f"❌ 예상치 못한 오류 (fetch_volume_surge_stocks): {e}")
-            # traceback 출력 추가 (상세 디버깅)
-            import traceback
-            traceback.print_exc()
-        return []
+            self.add_log(f"❌ [API {tr_id}] 예상치 못한 오류 (fetch_volume_surge_rank): {e}")
+            self.add_log(traceback.format_exc())
+            return {'return_code': -99, 'return_msg': str(e)}
 
-    async def fetch_multiple_stock_details(self, stock_codes: List[str]) -> List[Dict]:
-        if not stock_codes: return []
-        url = "/api/dostk/stkinfo"; tr_id = "ka10095"
-        headers = await self._get_headers(tr_id)
-        if not headers: return []
-        body = {"stk_cd": "|".join(stock_codes)}
-        try:
-            res = await self.client.post(f"{self.base_url}{url}", headers=headers, json=body)
-            res.raise_for_status(); data = res.json()
-            result_key = 'atn_stk_infr' if 'atn_stk_infr' in data else ('output1' if 'output1' in data else None)
-            if data and result_key and data.get(result_key) and data.get('rt_cd') == '0':
-                print(f"✅ 다수 종목 ({len(stock_codes)}개) 상세 정보 조회 성공")
-                return data[result_key]
-            else: print(f"⚠️ 다수 종목 상세 정보 데이터 없음: {data.get('msg1', 'API 응답 없음')}"); return []
-        except Exception as e: print(f"❌ 다수 종목 상세 정보 조회 오류: {e}"); return []
-
-    # --- 주문 API ---
-    async def create_buy_order(self, stock_code: str, quantity: int, price: int = 0) -> Optional[Dict]:
-        url = "/api/dostk/ordr"; tr_id = "kt10000"
+    async def create_buy_order(self, stock_code: str, quantity: int, price: Optional[int] = None) -> Optional[Dict]:
+        url_path = "/api/dostk/ordr"; tr_id = "kt10000"
+        full_url = f"{self.base_url}{url_path}"
+        self.add_log(f"  -> [CREATE_BUY_{tr_id}] 시작: 종목({stock_code}), 수량({quantity}), 가격({price})")
         headers = await self._get_headers(tr_id, is_order=True)
-        if not headers: return None
-        account_prefix, account_suffix = (self.account_no.split('-') + [''])[:2] if self.account_no and '-' in self.account_no else (None, None)
-        if not account_prefix or not account_suffix: print("❌ 매수 주문 실패: 계좌번호 형식 오류."); return None
-
-        trade_type = "3" if price == 0 else "0"
-        body = { "canp_no": account_prefix, "acnm_no": account_suffix, "ord_gno": "01",
-                 "dmst_stex_tp": "KRX", "stk_cd": stock_code, "ord_qty": str(quantity),
-                 "ord_uv": str(price) if price > 0 else "0", "trde_tp": trade_type }
+        if not headers: self.add_log(f"❌ [CREATE_BUY_{tr_id}] 실패: 헤더 생성 실패 ({stock_code})."); return None
+        order_price_str = str(price) if price is not None and price > 0 else ""
+        trade_type = "0" if price is not None and price > 0 else "3"
+        body = { "dmst_stex_tp": "KRX", "stk_cd": stock_code, "ord_qty": str(quantity), "ord_uv": order_price_str, "trde_tp": trade_type, "cond_uv": "" }
         try:
-            print(f"➡️ 매수 주문 요청: {body}")
-            res = await self.client.post(f"{self.base_url}{url}", headers=headers, json=body)
+            self.add_log(f"  -> [CREATE_BUY_{tr_id}] API 요청 시도 ({stock_code})... Body: {body}")
+            res = await self.client.post(full_url, headers=headers, json=body)
+            self.add_log(f"  <- [CREATE_BUY_{tr_id}] API 응답 수신 ({stock_code}). Status: {res.status_code}")
             res.raise_for_status(); data = res.json()
-            if data and data.get('output1', {}).get('rt_cd') == '0':
-                ord_no = data.get('output2', {}).get('ord_no')
-                msg = data.get('output1', {}).get('msg1', '성공')
-                print(f"✅ [매수 주문 성공] {stock_code} {quantity}주 ({'시장가' if price==0 else f'지정가 {price}'}). 주문번호: {ord_no}")
-                return {'return_code': 0, 'ord_no': ord_no, 'msg': msg}
+            self.add_log(f"  <- [CREATE_BUY_{tr_id}] API 응답 JSON 파싱 완료 ({stock_code}).")
+            return_code = data.get('return_code')
+            return_msg = data.get('return_msg', '')
+            order_no = data.get('ord_no')
+            self.add_log(f"  - [CREATE_BUY_{tr_id}] 응답 처리 시작 ({stock_code}): code={return_code}, msg={return_msg}, ord_no={order_no}")
+            if (return_code == 0 or return_code == '0') and order_no:
+                self.add_log(f"  ✅ [CREATE_BUY_{tr_id}] 성공 ({stock_code}): 주문번호={order_no}"); return data # 성공 시 전체 응답 반환
             else:
-                error_msg = data.get('output1', {}).get('msg1', 'API 실패'); print(f"❌ [매수 주문 API 오류] {stock_code}. 오류: {error_msg}")
-                return {'return_code': -1, 'error': error_msg}
+                error_msg = return_msg if return_msg else 'API 응답 없음 또는 형식 오류'
+                self.add_log(f"  ❌ [CREATE_BUY_{tr_id}] 실패 ({stock_code}): {error_msg} (return_code: {return_code})")
+                self.add_log(f"📄 API Raw Response: {data}"); return data # 실패 시에도 전체 응답 반환 (오류 코드 포함)
         except httpx.HTTPStatusError as e:
             error_text = e.response.text; error_msg = error_text
-            try: error_data = e.response.json(); error_msg = error_data.get('msg1', error_text)
+            try: error_json = e.response.json(); error_msg = error_json.get('return_msg', error_text)
             except: pass
-            print(f"❌ [매수 주문 HTTP 오류 {e.response.status_code}] {stock_code}. 오류: {error_msg}")
-            return {'return_code': e.response.status_code, 'error': error_text}
-        except Exception as e:
-            print(f"❌ [매수 주문 오류] {stock_code}. 오류: {e}"); return {'return_code': -99, 'error': str(e)}
+            self.add_log(f"  ❌ [CREATE_BUY_{tr_id}] HTTP 오류 ({stock_code}, Status:{e.response.status_code}): {error_msg}"); print(traceback.format_exc()); return {'return_code': e.response.status_code, 'return_msg': error_msg}
+        except httpx.RequestError as e: self.add_log(f"  ❌ [CREATE_BUY_{tr_id}] 네트워크 오류 ({stock_code}): {e}"); print(traceback.format_exc()); return {'return_code': -1, 'return_msg': str(e)}
+        except Exception as e: self.add_log(f"  ❌ [CREATE_BUY_{tr_id}] 예상치 못한 오류 ({stock_code}): {e}"); print(traceback.format_exc()); return {'return_code': -99, 'return_msg': str(e)}
+        # self.add_log(f"  -> [CREATE_BUY_{tr_id}] 함수 종료 (None 반환 예정) ({stock_code})."); return None # 로깅 변경
 
-    async def create_sell_order(self, stock_code: str, quantity: int, price: int = 0) -> Optional[Dict]:
-        url = "/api/dostk/ordr"; tr_id = "kt10001"
+    async def create_sell_order(self, stock_code: str, quantity: int, price: Optional[int] = None) -> Optional[Dict]:
+        url_path = "/api/dostk/ordr"; tr_id = "kt10001" # 매도 API ID 확인 (kt10001 사용)
+        full_url = f"{self.base_url}{url_path}"
+        self.add_log(f"  -> [CREATE_SELL_{tr_id}] 시작: 종목({stock_code}), 수량({quantity}), 가격({price})")
         headers = await self._get_headers(tr_id, is_order=True)
-        if not headers: return None
-        account_prefix, account_suffix = (self.account_no.split('-') + [''])[:2] if self.account_no and '-' in self.account_no else (None, None)
-        if not account_prefix or not account_suffix: print("❌ 매도 주문 실패: 계좌번호 형식 오류."); return None
-
-        trade_type = "3" if price == 0 else "0"
-        body = { "canp_no": account_prefix, "acnm_no": account_suffix, "ord_gno": "01",
-                 "dmst_stex_tp": "KRX", "stk_cd": stock_code, "ord_qty": str(quantity),
-                 "ord_uv": str(price) if price > 0 else "0", "trde_tp": trade_type }
+        if not headers: self.add_log(f"❌ [CREATE_SELL_{tr_id}] 실패: 헤더 생성 실패 ({stock_code})."); return None
+        order_price_str = str(price) if price is not None and price > 0 else ""
+        trade_type = "0" if price is not None and price > 0 else "3"
+        body = { "dmst_stex_tp": "KRX", "stk_cd": stock_code, "ord_qty": str(quantity), "ord_uv": order_price_str, "trde_tp": trade_type, "cond_uv": "" }
         try:
-            print(f"➡️ 매도 주문 요청: {body}")
-            res = await self.client.post(f"{self.base_url}{url}", headers=headers, json=body)
+            self.add_log(f"  -> [CREATE_SELL_{tr_id}] API 요청 시도 ({stock_code})... Body: {body}")
+            res = await self.client.post(full_url, headers=headers, json=body)
+            self.add_log(f"  <- [CREATE_SELL_{tr_id}] API 응답 수신 ({stock_code}). Status: {res.status_code}")
             res.raise_for_status(); data = res.json()
-            if data and data.get('output1', {}).get('rt_cd') == '0':
-                ord_no = data.get('output2', {}).get('ord_no')
-                msg = data.get('output1', {}).get('msg1', '성공')
-                print(f"✅ [매도 주문 성공] {stock_code} {quantity}주 ({'시장가' if price==0 else f'지정가 {price}'}). 주문번호: {ord_no}")
-                return {'return_code': 0, 'ord_no': ord_no, 'msg': msg}
+            self.add_log(f"  <- [CREATE_SELL_{tr_id}] API 응답 JSON 파싱 완료 ({stock_code}).")
+            return_code = data.get('return_code')
+            return_msg = data.get('return_msg', '')
+            order_no = data.get('ord_no')
+            self.add_log(f"  - [CREATE_SELL_{tr_id}] 응답 처리 시작 ({stock_code}): code={return_code}, msg={return_msg}, ord_no={order_no}")
+            if (return_code == 0 or return_code == '0') and order_no:
+                self.add_log(f"  ✅ [CREATE_SELL_{tr_id}] 성공 ({stock_code}): 주문번호={order_no}"); return data
             else:
-                error_msg = data.get('output1', {}).get('msg1', 'API 실패'); print(f"❌ [매도 주문 API 오류] {stock_code}. 오류: {error_msg}")
-                return {'return_code': -1, 'error': error_msg}
+                error_msg = return_msg if return_msg else 'API 응답 없음 또는 형식 오류'
+                self.add_log(f"  ❌ [CREATE_SELL_{tr_id}] 실패 ({stock_code}): {error_msg} (return_code: {return_code})")
+                self.add_log(f"📄 API Raw Response: {data}"); return data
         except httpx.HTTPStatusError as e:
             error_text = e.response.text; error_msg = error_text
-            try: error_data = e.response.json(); error_msg = error_data.get('msg1', error_text)
+            try: error_json = e.response.json(); error_msg = error_json.get('return_msg', error_text)
             except: pass
-            print(f"❌ [매도 주문 HTTP 오류 {e.response.status_code}] {stock_code}. 오류: {error_msg}")
-            return {'return_code': e.response.status_code, 'error': error_text}
-        except Exception as e:
-            print(f"❌ [매도 주문 오류] {stock_code}. 오류: {e}"); return {'return_code': -99, 'error': str(e)}
+            self.add_log(f"  ❌ [CREATE_SELL_{tr_id}] HTTP 오류 ({stock_code}, Status:{e.response.status_code}): {error_msg}"); print(traceback.format_exc()); return {'return_code': e.response.status_code, 'return_msg': error_msg}
+        except httpx.RequestError as e: self.add_log(f"  ❌ [CREATE_SELL_{tr_id}] 네트워크 오류 ({stock_code}): {e}"); print(traceback.format_exc()); return {'return_code': -1, 'return_msg': str(e)}
+        except Exception as e: self.add_log(f"  ❌ [CREATE_SELL_{tr_id}] 예상치 못한 오류 ({stock_code}): {e}"); print(traceback.format_exc()); return {'return_code': -99, 'return_msg': str(e)}
+        # self.add_log(f"  -> [CREATE_SELL_{tr_id}] 함수 종료 (None 반환 예정) ({stock_code})."); return None
 
     async def cancel_order(self, order_no: str, stock_code: str, quantity: int = 0) -> Optional[Dict]:
-        url = "/api/dostk/ordr"; tr_id = "kt10003"
+        url_path = "/api/dostk/ordr"; tr_id = "kt10003" # 취소 API ID 확인 (kt10003 사용)
+        full_url = f"{self.base_url}{url_path}"
+        self.add_log(f"  -> [CANCEL_ORDER_{tr_id}] 시작: 원주문({order_no}), 종목({stock_code}), 수량({quantity})")
         headers = await self._get_headers(tr_id, is_order=True)
-        if not headers: return None
-        account_prefix, account_suffix = (self.account_no.split('-') + [''])[:2] if self.account_no and '-' in self.account_no else (None, None)
-        if not account_prefix or not account_suffix: print("❌ 주문 취소 실패: 계좌번호 형식 오류."); return None
-
+        if not headers: self.add_log(f"❌ [CANCEL_ORDER_{tr_id}] 실패: 헤더 생성 실패 ({stock_code})."); return None
         cancel_qty_str = "0" if quantity == 0 else str(quantity)
-        body = { "canp_no": account_prefix, "acnm_no": account_suffix, "ord_gno": "01",
-                 "dmst_stex_tp": "KRX", "orig_ord_no": order_no, "stk_cd": stock_code,
-                 "cncl_qty": cancel_qty_str }
+        body = { "dmst_stex_tp": "KRX", "orig_ord_no": order_no, "stk_cd": stock_code, "cncl_qty": cancel_qty_str }
         try:
-            print(f"➡️ 주문 취소 요청: {body}")
-            res = await self.client.post(f"{self.base_url}{url}", headers=headers, json=body)
+            self.add_log(f"  -> [CANCEL_ORDER_{tr_id}] API 요청 시도 ({stock_code})... Body: {body}")
+            res = await self.client.post(full_url, headers=headers, json=body)
+            self.add_log(f"  <- [CANCEL_ORDER_{tr_id}] API 응답 수신 ({stock_code}). Status: {res.status_code}")
             res.raise_for_status(); data = res.json()
-            if data and data.get('output1', {}).get('rt_cd') == '0':
-                new_ord_no = data.get('output2', {}).get('ord_no')
-                msg = data.get('output1', {}).get('msg1', '성공')
-                print(f"✅ [주문 취소 성공] 원주문: {order_no}, 취소 주문번호: {new_ord_no}")
-                return {'return_code': 0, 'ord_no': new_ord_no, 'msg': msg}
+            self.add_log(f"  <- [CANCEL_ORDER_{tr_id}] API 응답 JSON 파싱 완료 ({stock_code}).")
+            return_code = data.get('return_code')
+            return_msg = data.get('return_msg', '')
+            new_ord_no = data.get('ord_no')
+            self.add_log(f"  - [CANCEL_ORDER_{tr_id}] 응답 처리 시작 ({stock_code}): code={return_code}, msg={return_msg}, new_ord_no={new_ord_no}")
+            if (return_code == 0 or return_code == '0') and new_ord_no:
+                self.add_log(f"  ✅ [CANCEL_ORDER_{tr_id}] 성공 ({stock_code}): 원주문={order_no}, 취소주문={new_ord_no}"); return data
             else:
-                error_msg = data.get('output1', {}).get('msg1', 'API 실패'); print(f"❌ [주문 취소 API 오류] 원주문: {order_no}. 오류: {error_msg}")
-                return {'return_code': -1, 'error': error_msg}
+                error_msg = return_msg if return_msg else 'API 응답 없음 또는 형식 오류'
+                self.add_log(f"  ❌ [CANCEL_ORDER_{tr_id}] 실패 ({stock_code}): {error_msg} (return_code: {return_code})")
+                self.add_log(f"📄 API Raw Response: {data}"); return data
         except httpx.HTTPStatusError as e:
             error_text = e.response.text; error_msg = error_text
-            try: error_data = e.response.json(); error_msg = error_data.get('msg1', error_text)
+            try: error_json = e.response.json(); error_msg = error_json.get('return_msg', error_text)
             except: pass
-            print(f"⚠️ [주문 취소 HTTP 오류 {e.response.status_code}] 원주문: {order_no}. 오류: {error_msg}")
-            return {'return_code': e.response.status_code, 'error': error_text}
-        except Exception as e:
-            print(f"❌ [주문 취소 오류] 원주문: {order_no}. 오류: {e}"); return {'return_code': -99, 'error': str(e)}
-        
+            self.add_log(f"  ❌ [CANCEL_ORDER_{tr_id}] HTTP 오류 ({stock_code}, Status:{e.response.status_code}): {error_msg}"); print(traceback.format_exc()); return {'return_code': e.response.status_code, 'return_msg': error_msg}
+        except httpx.RequestError as e: self.add_log(f"  ❌ [CANCEL_ORDER_{tr_id}] 네트워크 오류 ({stock_code}): {e}"); print(traceback.format_exc()); return {'return_code': -1, 'return_msg': str(e)}
+        except Exception as e: self.add_log(f"  ❌ [CANCEL_ORDER_{tr_id}] 예상치 못한 오류 ({stock_code}): {e}"); print(traceback.format_exc()); return {'return_code': -99, 'return_msg': str(e)}
+        # self.add_log(f"  -> [CANCEL_ORDER_{tr_id}] 함수 종료 (None 반환 예정) ({stock_code})."); return None
+
     async def fetch_account_balance(self) -> Optional[Dict]:
-        """예수금 상세 현황을 요청합니다. (API ID: kt00001)"""
-        url = "/api/dostk/acnt"; tr_id = "kt00001"
-        # _get_headers 에서 자동으로 is_mock 여부에 따라 app_key, app_secret 사용
-        headers = await self._get_headers(tr_id, is_order=True) # 계좌 정보 필요
-        if not headers: return None
-
-        # 계좌번호 분리 (is_mock 여부에 따라 account_no 가 이미 설정됨)
-        account_prefix, account_suffix = (self.account_no.split('-') + [''])[:2] if self.account_no and '-' in self.account_no else (None, None)
-        if not account_prefix or not account_suffix:
-            print("❌ 예수금 조회 실패: 계좌번호 형식 오류."); return None
-
-        body = {
-            "canp_no": account_prefix,
-            "acnm_no": account_suffix,
-            "qry_tp": "2", # 2: 일반조회
-            "acnm_prsc_cd": "01", # 계좌상품코드 (01: 위탁)
-            "pwd_tp_cd": "00" # 비밀번호구분 (00: 없음)
-        }
+        url_path = "/api/dostk/acnt"; tr_id = "kt00001"
+        full_url = f"{self.base_url}{url_path}"
+        headers = await self._get_headers(tr_id, is_order=True) # is_order=True 추가
+        if not headers: self.add_log("❌ 예수금 조회 실패: 헤더 생성 실패."); return None
+        body = {"qry_tp": "2"}
         try:
-            print(f"🔍 예수금 조회 요청 Body: {body}")
-            # base_url 은 __init__ 에서 is_mock 에 따라 설정됨
-            res = await self.client.post(f"{self.base_url}{url}", headers=headers, json=body)
+            res = await self.client.post(full_url, headers=headers, json=body)
             res.raise_for_status(); data = res.json()
-
-            if data and data.get('output1') and data.get('rt_cd') == '0':
-                balance_info = data['output1']
-                print(f"✅ 예수금 조회 성공: {balance_info.get('ord_alowa', 'N/A')}")
-                return balance_info
+            return_code = data.get('return_code')
+            return_msg = data.get('return_msg', '')
+            balance_info = data
+            if (return_code == 0 or return_code == '0'):
+                if 'ord_alow_amt' in balance_info:
+                    return balance_info
+                else:
+                    self.add_log(f"⚠️ [API {tr_id}] 예수금 조회 성공했으나 'ord_alow_amt' 필드 없음."); self.add_log(f"📄 API Raw Response: {data}"); return {'return_code': 0, 'return_msg': "'ord_alow_amt' missing"}
             else:
-                error_msg = data.get('msg1', 'API 응답 없음')
-                print(f"⚠️ 예수금 데이터 없음: {error_msg}")
-                print(f"📄 API Raw Response: {data}")
-                return None
+                error_msg = return_msg if return_msg else 'API 응답 없음 또는 형식 오류'
+                self.add_log(f"⚠️ [API {tr_id}] 예수금 데이터 없음: {error_msg} (return_code: {return_code})"); self.add_log(f"📄 API Raw Response: {data}"); return {'return_code': return_code, 'return_msg': error_msg}
         except httpx.HTTPStatusError as e:
             error_text = e.response.text; error_msg = error_text
-            try: error_data = e.response.json(); error_msg = error_data.get('msg1', error_text)
+            try: error_json = e.response.json(); error_msg = error_json.get('return_msg', error_text)
             except: pass
-            print(f"❌ 예수금 조회 HTTP 오류 {e.response.status_code}: {error_msg}")
-        except Exception as e:
-            print(f"❌ 예수금 조회 오류: {e}")
-            print(traceback.format_exc())
-        return None
+            self.add_log(f"❌ [API {tr_id}] 예수금 조회 오류 (HTTP {e.response.status_code}): {error_msg}"); return {'return_code': e.response.status_code, 'return_msg': error_msg}
+        except httpx.RequestError as e: self.add_log(f"❌ [API {tr_id}] 예수금 조회 네트워크 오류: {e}"); return {'return_code': -1, 'return_msg': str(e)}
+        except Exception as e: self.add_log(f"❌ [API {tr_id}] 예수금 조회 중 예상치 못한 오류: {e}"); print(traceback.format_exc()); return {'return_code': -99, 'return_msg': str(e)}
+
+    def _split_account_no(self) -> Optional[tuple[str, str]]:
+        clean_account_no = self.account_no.replace('-', '') if self.account_no else ""
+        account_prefix = ""; account_suffix = ""
+        if len(clean_account_no) == 8:
+            account_prefix = clean_account_no; account_suffix = "01"
+            return account_prefix, account_suffix
+        elif len(clean_account_no) >= 10:
+            account_prefix = clean_account_no[:8]; account_suffix = clean_account_no[8:10]
+            return account_prefix, account_suffix
+        else:
+            self.add_log(f"❌ [계좌 분리] 실패: 지원하지 않는 계좌번호 길이({len(clean_account_no)})")
+            return None
