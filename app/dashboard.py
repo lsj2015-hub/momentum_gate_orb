@@ -187,8 +187,11 @@ with col1:
   st.markdown("---")
   st.markdown("##### **스크리닝 후보 종목**")
   # candidate_stock_codes 속성 존재 확인
-  if hasattr(engine, 'candidate_stock_codes') and engine.candidate_stock_codes:
-    st.code(", ".join(engine.candidate_stock_codes), language="text")
+  if hasattr(engine, 'candidate_stocks_info') and engine.candidate_stocks_info:
+    # 종목 정보를 "코드(이름)" 형식의 문자열 리스트로 변환
+    display_candidates = [f"{info['stk_cd']} ({info['stk_nm']})" for info in engine.candidate_stocks_info]
+    st.code('\n'.join(display_candidates), language='text') # 여러 줄로 표시
+  # --- 👆 수정 끝 ---
   else:
     st.info("현재 스크리닝된 후보 종목 없음")
 
@@ -220,7 +223,7 @@ st.divider()
 st.subheader("📝 Trading Logs")
 # 로그가 변경되었을 수 있으므로 최신 상태 표시
 # logs 속성 존재 확인
-log_list = getattr(engine, 'logs', ["로그 속성 없음."])
+log_list = getattr(engine, 'logs', ["로그 속성 없음."]) # engine 객체에 logs 속성이 없어도 오류 방지
 log_text = "\n".join(log_list)
 st.text_area("Logs", value=log_text, height=300, disabled=True, key="log_area") # key 추가
 

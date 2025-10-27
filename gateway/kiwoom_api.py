@@ -227,7 +227,6 @@ class KiwoomAPI:
         self.add_log("👂 실시간 메시지 수신 대기 중...")
         try:
             async for message in self.websocket:
-                # self.add_log(f"📬 WS 수신: {message[:200]}{'...' if len(str(message)) > 200 else ''}") # 너무 많은 로그 방지
 
                 if isinstance(message, bytes): continue
                 if not isinstance(message, str) or not message.strip(): continue
@@ -240,10 +239,18 @@ class KiwoomAPI:
                         code = data.get("code"); msg = data.get("message")
                         self.add_log(f"ℹ️ WS 시스템 메시지: [{code}] {msg}")
                         continue
+                    
+                    # --- 👇 PING 처리 로직 복구 ---
+                    elif trnm == 'PING':
+                        self.add_log(">>> PING 수신. PING을 그대로 응답합니다.")
+                        # 수신한 PING 메시지 문자열을 그대로 다시 보냄
+                        asyncio.create_task(self.send_websocket_request_raw(message))
+                        continue # PING 처리는 여기서 종료
+                    # --- 👆 PING 처리 복구 끝 ---
 
                     if trnm == 'LOGIN': continue
 
-                    # --- 👇 수정: REG/REMOVE 응답도 message_handler로 전달 ---
+                    # --- 👇 REG/REMOVE 응답도 message_handler로 전달 ---
                     if trnm in ['REG', 'REMOVE']:
                         rt_cd_raw = data.get('return_code')
                         msg = data.get('return_msg', '메시지 없음')
@@ -255,7 +262,6 @@ class KiwoomAPI:
                             self.message_handler(data) # data 딕셔너리 전체 전달
                         # continue 제거: 아래 REAL 처리 로직과 분리
 
-                    # --- 👇 수정: REALTIME 데이터 처리 로직 수정 ---
                     elif trnm == 'REAL':
                         realtime_data_list = data.get('data')
                         if isinstance(realtime_data_list, list):
@@ -276,7 +282,6 @@ class KiwoomAPI:
                                     self.add_log(f"⚠️ 실시간 데이터 항목 형식 오류: {item_data}")
                         else:
                             self.add_log(f"⚠️ 'REAL' 메시지 data 필드 오류: {data}")
-                    # --- 👆 수정 끝 ---
 
                     else: # PONG 또는 알 수 없는 trnm
                         if trnm != 'PONG':
@@ -440,24 +445,40 @@ class KiwoomAPI:
             'mrkt_tp': '000', 'sort_tp': '2', 'tm_tp': '1', 'tm': '5',
             'trde_qty_tp': '10', 'stk_cnd': '14', 'pric_tp': '8', 'stex_tp': '3'
         }
-        body = {**default_params, **kwargs} # kwargs로 기본값 덮어쓰기
+        raw_body = {**default_params, **kwargs} # kwargs로 기본값 덮어쓰기
+
+        # --- 👇 타입 변환 로직 추가 ---
+        body = {}
+        for key, value in raw_body.items():
+            if key in ['tm', 'trde_qty_tp'] and isinstance(value, (int, float)):
+                # tm과 trde_qty_tp 파라미터를 문자열로 변환
+                body[key] = str(value)
+            elif key == 'trde_qty_tp' and isinstance(value, str):
+                # trde_qty_tp가 문자열일 경우, 앞에 0을 붙여 4자리로 만드는 로직 (API 문서 길이 오류 가능성 대비)
+                # 예: '10' -> '0010', '100' -> '0100' (필요 없을 경우 이 elif 블록 제거)
+                # body[key] = value.zfill(4)
+                body[key] = value # 우선 원본 문자열 사용
+            else:
+                body[key] = value
+        # --- 👆 타입 변환 로직 추가 끝 ---
 
         try:
-            self.add_log(f"🔍 [API {tr_id}] 거래량 급증 요청 Body: {body}")
+            # 수정된 body 사용
+            self.add_log(f"🔍 [API {tr_id}] 거래량 급증 요청 Body (수정됨): {body}")
             res = await self.client.post(full_url, headers=headers, json=body)
             res.raise_for_status(); data = res.json()
-            # self.add_log(f"📄 [API {tr_id}] 거래량 급증 응답: {str(data)[:200]}...") # 로그 간소화
+
+            # ... (이하 try 구문 동일) ...
 
             return_code = data.get('return_code')
             return_msg = data.get('return_msg', '')
 
             if return_code == 0 or return_code == '0':
-                # self.add_log(f"✅ [API {tr_id}] 거래량 급증 조회 성공") # 로그 간소화
-                return data # 전체 응답 반환 (결과 키 포함)
+                return data
             else:
                 self.add_log(f"⚠️ [API {tr_id}] 거래량 급증 데이터 없음: {return_msg} (return_code: {return_code})")
                 self.add_log(f"📄 API Raw Response: {data}")
-                return {'return_code': return_code, 'return_msg': return_msg} # 실패 정보 반환
+                return {'return_code': return_code, 'return_msg': return_msg}
         except httpx.HTTPStatusError as e:
             error_text = e.response.text; error_msg = error_text
             try: error_json = e.response.json(); error_msg = error_json.get('return_msg', error_text)
