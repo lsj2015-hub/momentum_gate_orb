@@ -221,73 +221,64 @@ class TradingEngine:
       """웹소켓으로부터 실시간 데이터를 받아 해당 처리 함수 호출 (콜백)"""
       try:
           trnm = ws_data.get('trnm')
-          # 실시간 데이터 상세 로깅 (필요시 주석 해제)
-          # self.add_log(f"   [INFO] handle_realtime_data 수신: trnm='{trnm}', data='{str(ws_data)[:150]}...'")
 
           if trnm == 'REAL':
               data_type = ws_data.get('type')
               values = ws_data.get('values')
-              # --- 👇 item_code_raw 정의 수정 ---
-              item_code_raw = ws_data.get('item', '') # 키움은 종목코드에 'A' prefix 붙임, 없으면 빈 문자열
-              # --- 👆 수정 끝 ---
+              item_code_raw = ws_data.get('item', '')
 
-              if not data_type or not values: # item_code_raw는 00, 04의 경우 없을 수 있음
+              if not data_type or not values:
                   self.add_log(f"  ⚠️ [WS_REAL] 실시간 데이터 항목 형식 오류 (type/values 누락): {ws_data}")
                   return
 
-              # --- 종목 코드 정제 (item_code_raw가 있을 때만) ---
               stock_code = None
               if item_code_raw:
                   stock_code = item_code_raw[1:] if item_code_raw.startswith('A') else item_code_raw
                   if stock_code.endswith(('_NX', '_AL')): stock_code = stock_code[:-3]
-              # --- 정제 끝 ---
 
-              # 데이터 타입별 처리 함수 호출 (비동기 Task 생성)
+              # 데이터 타입별 처리 함수 호출
               if data_type == '0B': # 주식 체결
-                  if stock_code: # 종목 코드가 있을 때만 처리
-                      asyncio.create_task(self._process_realtime_execution(stock_code, values))
+                  if stock_code: asyncio.create_task(self._process_realtime_execution(stock_code, values))
               elif data_type == '0D': # 주식 호가 잔량
-                  if stock_code:
-                      asyncio.create_task(self._process_realtime_orderbook(stock_code, values))
+                  if stock_code: asyncio.create_task(self._process_realtime_orderbook(stock_code, values))
               elif data_type == '00': # 주문 체결 응답
                   asyncio.create_task(self._process_execution_update(values))
               elif data_type == '04': # 잔고 업데이트
-                  if stock_code: # 잔고 업데이트도 stock_code 필요
-                      asyncio.create_task(self._process_balance_update(stock_code, values)) # stock_code 전달
+                  # --- 👇 stock_code가 있을 때만 호출 ---
+                  if stock_code: asyncio.create_task(self._process_balance_update(stock_code, values))
+                  # --- 👆 ---
 
-          elif trnm in ['REG', 'REMOVE']: # 등록/해지 응답 처리
+          elif trnm in ['REG', 'REMOVE']:
               return_code_raw = ws_data.get('return_code')
               return_msg = ws_data.get('return_msg', '메시지 없음')
               try: return_code = int(str(return_code_raw).strip())
-              except: return_code = -1 # 변환 실패 시 오류 코드로 간주
+              except: return_code = -1
               self.add_log(f"📬 WS 응답 ({trnm}): code={return_code}, msg='{return_msg}'")
 
-              # 기본 TR 등록 성공/실패 플래그 처리 (start 함수 대기용)
               if trnm == 'REG' and not self._realtime_registered:
                   if return_code == 0:
                       self._realtime_registered = True
                       self.add_log("✅ [START] 웹소켓 기본 TR 등록 **성공** 확인 (플래그 설정).")
                   else:
                       self.add_log(f"🚨🚨🚨 [CRITICAL] 기본 TR 등록 실패 응답 수신! (code={return_code}). 엔진 에러 상태로 변경.")
-                      self.engine_status = 'ERROR' # 에러 상태로 변경하여 start 대기 해제
+                      self.engine_status = 'ERROR'
 
-          # LOGIN, PING, PONG 등은 api.py에서 처리하거나 여기서 무시
           elif trnm not in ['LOGIN', 'PING', 'PONG', 'SYSTEM']:
              self.add_log(f"ℹ️ 처리되지 않은 WS 메시지 수신 (TRNM: {trnm}): {str(ws_data)[:200]}...")
 
       except Exception as e:
           self.add_log(f"🚨🚨🚨 [CRITICAL] 실시간 데이터 처리 콜백 함수 오류: {e} | Data: {str(ws_data)[:200]}... 🚨🚨🚨")
-          self.add_log(traceback.format_exc()) # 상세 오류 스택 출력
+          self.add_log(traceback.format_exc())
 
   async def _process_realtime_execution(self, stock_code: str, values: Dict):
       """실시간 체결(0B) 데이터 처리 및 저장 (비동기)"""
       try:
-          exec_time_str = values.get('20') # 체결시간 (HHMMSS)
-          last_price_str = values.get('10') # 현재가 (부호포함)
-          exec_vol_str = values.get('15') # 거래량 (부호포함, +:매수체결, -:매도체결)
+          exec_time_str = values.get('20')
+          last_price_str = values.get('10')
+          exec_vol_str = values.get('15')
 
           if not exec_time_str or not last_price_str or not exec_vol_str:
-              self.add_log(f"  ⚠️ [RT_EXEC] 실시간 체결({stock_code}) 데이터 누락: {values}")
+              # self.add_log(f"  ⚠️ [RT_EXEC] 실시간 체결({stock_code}) 데이터 누락: {values}") # 로그 간소화
               return
 
           last_price = float(last_price_str.replace('+','').replace('-','').strip())
@@ -295,8 +286,7 @@ class TradingEngine:
 
           if stock_code not in self.realtime_data: self.realtime_data[stock_code] = {}
           self.realtime_data[stock_code].update({
-              'last_price': last_price,
-              'last_exec_time': exec_time_str,
+              'last_price': last_price, 'last_exec_time': exec_time_str,
               'last_exec_volume': abs(exec_vol_signed),
               'last_exec_side': 'BUY' if exec_vol_signed > 0 else ('SELL' if exec_vol_signed < 0 else 'UNKNOWN'),
               'timestamp': datetime.now()
@@ -314,7 +304,7 @@ class TradingEngine:
           total_ask_vol_str = values.get('121'); total_bid_vol_str = values.get('125')
 
           if not ask1_str or not bid1_str:
-              self.add_log(f"  ⚠️ [RT_OB] 실시간 호가({stock_code}) 데이터 누락 (ask1/bid1): {values}")
+              # self.add_log(f"  ⚠️ [RT_OB] 실시간 호가({stock_code}) 데이터 누락 (ask1/bid1): {values}") # 로그 간소화
               return
 
           ask1 = float(ask1_str.replace('+','').replace('-','').strip())
@@ -326,8 +316,7 @@ class TradingEngine:
 
           if stock_code not in self.realtime_data: self.realtime_data[stock_code] = {}
           self.realtime_data[stock_code].update({
-              'ask1': ask1, 'bid1': bid1,
-              'ask1_vol': ask1_vol, 'bid1_vol': bid1_vol,
+              'ask1': ask1, 'bid1': bid1, 'ask1_vol': ask1_vol, 'bid1_vol': bid1_vol,
               'total_ask_vol': total_ask_vol, 'total_bid_vol': total_bid_vol,
               'timestamp': datetime.now()
           })
@@ -341,9 +330,9 @@ class TradingEngine:
       try:
           account_no = exec_data.get('9201', '').strip()
           order_no = exec_data.get('9203', '').strip()
-          # --- 👇 stock_code_raw 정의 ---
-          stock_code_raw = exec_data.get('9001', '').strip() # 값 가져오기
-          # --- 👆 정의 끝 ---
+          # --- 👇 stock_code_raw 정의 수정 ---
+          stock_code_raw = exec_data.get('9001', '').strip() # 키움은 A005930 형태
+          # --- 👆 ---
           order_status = exec_data.get('913', '').strip()
           exec_qty_str = exec_data.get('911', '').strip()
           exec_price_str = exec_data.get('910', '').strip()
@@ -354,6 +343,7 @@ class TradingEngine:
               self.add_log(f"  ⚠️ [EXEC_UPDATE] 주문 체결 데이터 누락 (계좌/주문번호/종목코드): {exec_data}")
               return
 
+          # 종목 코드 정제
           stock_code = stock_code_raw[1:] if stock_code_raw.startswith('A') else stock_code_raw
           if stock_code.endswith(('_NX', '_AL')): stock_code = stock_code[:-3]
 
@@ -381,8 +371,7 @@ class TradingEngine:
                    position_info = pos
                    target_code_for_pos = stock_code
 
-          if not position_info or not target_code_for_pos:
-              return
+          if not position_info or not target_code_for_pos: return
 
           current_pos_status = position_info.get('status')
 
@@ -396,10 +385,8 @@ class TradingEngine:
                   if unfilled_qty == 0:
                       entry_price = filled_value / filled_qty if filled_qty > 0 else 0
                       position_info.update({
-                          'status': 'IN_POSITION',
-                          'entry_price': entry_price,
-                          'entry_time': datetime.now(),
-                          'size': filled_qty,
+                          'status': 'IN_POSITION', 'entry_price': entry_price,
+                          'entry_time': datetime.now(), 'size': filled_qty,
                       })
                       self.add_log(f"   ✅ [EXEC_UPDATE] 매수 완전 체결: [{target_code_for_pos}] 진입가={entry_price:.2f}, 수량={filled_qty}")
                   else:
@@ -417,9 +404,9 @@ class TradingEngine:
                   position_info['filled_qty'] = filled_qty
                   position_info['filled_value'] = filled_value
 
-                  # --- 👇 original_size 정의 ---
-                  original_size = position_info.get('original_size_before_exit', '?') # 변수 정의
-                  # --- 👆 정의 끝 ---
+                  # --- 👇 original_size_before_exit 변수 사용 ---
+                  original_size = position_info.get('original_size_before_exit', '?')
+                  # --- 👆 ---
 
                   if unfilled_qty == 0:
                       exit_price = filled_value / filled_qty if filled_qty > 0 else 0
@@ -432,12 +419,12 @@ class TradingEngine:
                   else:
                       # --- 👇 로그 변수 수정 ---
                       self.add_log(f"   ⏳ [EXEC_UPDATE] 매도 부분 체결: [{target_code_for_pos}] 누적 {filled_qty}/{original_size}")
-                      # --- 👆 수정 끝 ---
+                      # --- 👆 ---
 
                elif order_status in ['취소', '거부', '확인']:
-                   # --- 👇 remaining_size_after_cancel 정의 ---
+                   # --- 👇 remaining_size_after_cancel 정의 수정 ---
                    remaining_size_after_cancel = position_info.get('original_size_before_exit', 0) - position_info.get('filled_qty', 0)
-                   # --- 👆 정의 끝 ---
+                   # --- 👆 ---
                    self.add_log(f"   ⚠️ [EXEC_UPDATE] 매도 주문 취소/거부/확인 ({order_status}): [{target_code_for_pos}] 주문번호 {order_no}, 미체결 잔량={unfilled_qty}, 엔진 계산 잔량={remaining_size_after_cancel}")
                    if unfilled_qty > 0 and remaining_size_after_cancel > 0:
                        position_info['status'] = 'IN_POSITION'
@@ -460,21 +447,14 @@ class TradingEngine:
       """실시간 잔고(TR ID: 04) 데이터 처리 (비동기)"""
       try:
           account_no = balance_data.get('9201', '').strip()
-          # --- 👇 stock_code_raw 정의 (values['9001'] 대신 전달받은 stock_code 사용) ---
-          # stock_code_raw = balance_data.get('9001', '').strip() # 제거
-          # --- 👆 정의 끝 ---
           current_size_str = balance_data.get('930', '').strip()
           avg_price_str = balance_data.get('931', '').strip()
 
-          # 필수 정보 확인 (stock_code는 이미 함수 인자로 받음)
           if not account_no:
-              self.add_log(f"  ⚠️ [BALANCE_UPDATE] 잔고 데이터 누락 (계좌): {balance_data}")
+              # self.add_log(f"  ⚠️ [BALANCE_UPDATE] 잔고 데이터 누락 (계좌): {balance_data}") # 로그 간소화
               return
 
-          # --- 👇 종목 코드 정제 로직 제거 (이미 인자로 받음) ---
-          # stock_code = stock_code_raw[1:] if stock_code_raw.startswith('A') else stock_code_raw
-          # if stock_code.endswith(('_NX', '_AL')): stock_code = stock_code[:-3]
-          # --- 👆 제거 끝 ---
+          # stock_code는 이미 인자로 받음
 
           try: current_size = int(current_size_str) if current_size_str else 0
           except ValueError: current_size = 0
@@ -604,7 +584,9 @@ class TradingEngine:
 
       self.add_log(f"⚙️ [TICK_ALL] 순차 처리 시작 (대상: {list(codes_to_process)})")
       processed_count = 0
-      for stock_code in list(codes_to_process): # 순회 중 변경될 수 있으므로 list 복사
+      # --- 👇 순회 중 변경될 수 있으므로 list()로 복사 ---
+      for stock_code in list(codes_to_process):
+      # --- 👆 ---
           last_tick = self.last_stock_tick_time.get(stock_code)
           if last_tick and (current_time - last_tick).total_seconds() < tick_interval_seconds:
               continue
@@ -626,8 +608,8 @@ class TradingEngine:
   async def process_single_stock_tick(self, stock_code: str):
       """개별 종목 Tick 처리: 데이터 조회, 지표 계산, 신호 판단, 주문 실행"""
       current_price = None
-      current_vwap = None # VWAP 값 저장 변수
-      df = None # DataFrame 초기화
+      current_vwap = None
+      df = None
       realtime_available = False
 
       # --- 1. 실시간 데이터 우선 확인 ---
@@ -639,39 +621,30 @@ class TradingEngine:
               if current_price: realtime_available = True
 
       # --- 2. REST API 호출 (실시간 없거나, 지표 계산 필요 시) ---
-      # 지표 계산(ORB, VWAP 등)을 위해선 분봉 데이터(df)가 필요
-      # 실시간 가격만 있고 df가 없거나, 실시간 가격이 없는 경우 호출
       if not realtime_available or df is None:
-          # self.add_log(f"   -> [{stock_code}] 분봉 데이터 API 호출...") # 필요시 주석 해제
           if not self.api: self.add_log(f"  ⚠️ [{stock_code}] API 없음. 분봉 조회 불가."); return
           raw_data = await self.api.fetch_minute_chart(stock_code, timeframe=1)
           if raw_data and raw_data.get('return_code') == 0:
               df = preprocess_chart_data(raw_data.get("stk_min_pole_chart_qry", []))
               if df is not None and not df.empty:
-                  if not realtime_available: # 실시간 가격 없던 경우만 df 가격 사용
+                  if not realtime_available:
                       current_price = df['close'].iloc[-1]
-              else:
-                  df = None # 빈 DataFrame이면 None으로 처리
-                  # self.add_log(f"  ⚠️ [{stock_code}] 분봉 데이터프레임 변환 실패 또는 비어있음.")
-          # else: # fetch_minute_chart 내부에서 오류 로그 처리됨
+              else: df = None
 
       # --- 3. 현재가 최종 확인 ---
       if current_price is None:
-          self.add_log(f"  ⚠️ [{stock_code}] 현재가 확인 불가 (실시간/API 모두). Tick 처리 중단.")
+          self.add_log(f"  ⚠️ [{stock_code}] 현재가 확인 불가. Tick 처리 중단.")
           return
 
       # --- 4. 지표 계산 (DataFrame 필요) ---
       orb_levels = pd.Series({'orh': None, 'orl': None})
-      if df is not None: # DataFrame이 있을 때만 계산
-          add_vwap(df)
+      if df is not None:
+          add_vwap(df) # VWAP 먼저 계산
           orb_levels = calculate_orb(df, timeframe=getattr(self.config.strategy, 'orb_timeframe', 15))
           current_vwap = df['VWAP'].iloc[-1] if 'VWAP' in df.columns and not pd.isna(df['VWAP'].iloc[-1]) else None
-          # --- EMA 추가 ---
-          # add_ema(df, short_period=9, long_period=20)
-          # --- OBI, RVOL 계산 (다음 단계) ---
-          # realtime_info = self.realtime_data.get(stock_code)
-          # obi = calculate_obi(realtime_info.get('total_bid_vol'), realtime_info.get('total_ask_vol')) if realtime_info else None
-          # rvol = calculate_rvol(df['volume'].iloc[-1], await self.get_historical_avg_volume(stock_code)) if not df.empty else None
+          # --- 👇 EMA 추가 ---
+          # add_ema(df, short_period=9, long_period=20) # 다음 단계에서 추가
+          # --- 👆 ---
       else:
           self.add_log(f"  ⚠️ [{stock_code}] 지표 계산용 DataFrame 없음. ORB/VWAP 등 계산 불가.")
 
@@ -684,13 +657,12 @@ class TradingEngine:
       position_info = self.positions.get(stock_code)
       current_status = position_info.get('status') if position_info else 'SEARCHING'
 
-      if current_status in ['PENDING_ENTRY', 'PENDING_EXIT']:
-          return # 주문 진행 중이면 건너뜀
+      if current_status in ['PENDING_ENTRY', 'PENDING_EXIT']: return
 
       try:
           # --- 진입 조건 (SEARCHING 상태) ---
           if current_status == 'SEARCHING':
-              if stock_code in self.candidate_stock_codes: # 스크리닝 후보일 때만 진입 시도
+              if stock_code in self.candidate_stock_codes:
                   signal = check_breakout_signal(
                       current_price, orb_levels, getattr(self.config.strategy, 'breakout_buffer', 0.15)
                   )
@@ -710,8 +682,6 @@ class TradingEngine:
                           else:
                               error_msg = order_result.get('return_msg', '주문 실패') if order_result else 'API 호출 실패'
                               self.add_log(f"   ❌ [{stock_code}] 매수 주문 실패: {error_msg}")
-                      # else: # calculate_order_quantity 내부에서 이미 로그 기록
-                      #     self.add_log(f"   - [{stock_code}] 주문 수량이 0이므로 매수 주문 실행 안 함.")
 
           # --- 청산 조건 (IN_POSITION 상태) ---
           elif current_status == 'IN_POSITION' and position_info:
@@ -733,11 +703,11 @@ class TradingEngine:
                     else:
                         error_msg = order_result.get('return_msg', '주문 실패') if order_result else 'API 호출 실패'
                         self.add_log(f"   ❌ [{stock_code}] 매도 주문 실패: {error_msg}")
-                        position_info['status'] = 'ERROR_LIQUIDATION' # 청산 실패 시 에러 상태
+                        position_info['status'] = 'ERROR_LIQUIDATION'
                 else:
                     self.add_log(f"   ⚠️ [{stock_code}] 청산할 수량 없음 ({sell_qty}). 포지션 정보 오류 가능성.")
-                    self.positions.pop(stock_code, None) # 오류 상태 포지션 제거
-                    await self._unsubscribe_realtime_stock(stock_code) # 구독 해지
+                    self.positions.pop(stock_code, None)
+                    await self._unsubscribe_realtime_stock(stock_code)
 
       except Exception as e:
           self.add_log(f"🚨🚨🚨 [CRITICAL] 개별 Tick 처리({stock_code}) 중 예상치 못한 심각한 오류 발생: {e} 🚨🚨🚨")
@@ -745,14 +715,12 @@ class TradingEngine:
 
   async def calculate_order_quantity(self, current_price: float) -> int:
       """주문 가능 현금과 설정된 투자 금액을 기반으로 주문 수량 계산"""
-      # 설정된 종목당 투자 금액 가져오기
       investment_amount_per_stock = getattr(self.config.strategy, 'investment_amount_per_stock', 0)
       if investment_amount_per_stock <= 0:
           self.add_log("   ⚠️ [DEBUG_ORDER_QTY] 설정된 투자 금액이 0 이하입니다.")
           return 0
       self.add_log(f"     [DEBUG_ORDER_QTY] 설정된 투자 금액: {investment_amount_per_stock}")
 
-      # API를 통해 주문 가능 현금 조회
       if not self.api: self.add_log("   ⚠️ [DEBUG_ORDER_QTY] API 없음. 현금 조회 불가."); return 0
       balance_info = await self.api.fetch_account_balance()
       if not balance_info or balance_info.get('return_code') != 0 or 'ord_alow_amt' not in balance_info:
@@ -769,7 +737,6 @@ class TradingEngine:
           return 0
       self.add_log(f"     [DEBUG_ORDER_QTY] 변환된 주문 가능 현금(int): {available_cash}")
 
-      # 주문 가능 금액과 설정 금액 비교
       self.add_log(f"     [DEBUG_ORDER_QTY] 비교: available_cash({available_cash}) >= investment_amount_per_stock({investment_amount_per_stock}) ?")
       if available_cash < investment_amount_per_stock:
           self.add_log(f"      - 주문 불가 사유: 현금 부족({available_cash} < {investment_amount_per_stock})")
@@ -778,7 +745,6 @@ class TradingEngine:
           self.add_log(f"      - 주문 불가 사유: 현재가({current_price})가 유효하지 않음.")
           return 0
       else:
-          # 수량 계산 (투자 금액 / 현재가)
           self.add_log(f"     [DEBUG_ORDER_QTY] 수량 계산 시도: investment({investment_amount_per_stock}) // current_price({current_price})")
           order_qty = int(investment_amount_per_stock // current_price)
           self.add_log(f"      - 주문 가능 현금: {available_cash:,}, 투자 예정: {investment_amount_per_stock:,}, 계산된 수량: {order_qty}주")
@@ -791,13 +757,12 @@ class TradingEngine:
       if not self.api: self.add_log("⚠️ [KILL] API 객체 없음."); return
 
       self.add_log("🚨🚨🚨 [KILL] Kill Switch 발동! 모든 주문 취소 및 포지션 청산 시작... 🚨🚨🚨")
-      self.engine_status = 'KILLED' # 킬 스위치 상태로 변경 (메인 루프 중단 유도)
-      self._stop_event.set() # 메인 루프 즉시 종료 요청
+      self.engine_status = 'KILLED'
+      self._stop_event.set()
 
       try:
-          # --- 1. 미체결 주문 조회 및 취소 (가정: fetch_pending_orders API 구현됨) ---
           self.add_log("  -> [KILL] 미체결 주문 조회 및 취소 시도...")
-          # pending_orders = await self.api.fetch_pending_orders() # ka10075 호출 구현 필요
+          # TODO: 미체결 주문 조회 API(ka10075) 호출 구현 필요
           pending_orders = [] # 임시
           if pending_orders:
               for order in pending_orders:
@@ -812,12 +777,10 @@ class TradingEngine:
           else:
               self.add_log("  - [KILL] 취소할 미체결 주문 없음.")
 
-          # --- 2. 보유 포지션 시장가 청산 ---
-          positions_to_liquidate = list(self.positions.items()) # items() 로 복사
+          positions_to_liquidate = list(self.positions.items())
           if positions_to_liquidate:
               self.add_log(f"  -> [KILL] {len(positions_to_liquidate)} 건의 보유 포지션 시장가 청산 시도...")
               for stock_code, pos_info in positions_to_liquidate:
-                  # 실제 보유 중인 포지션만 청산 대상
                   if pos_info.get('status') == 'IN_POSITION' and pos_info.get('size', 0) > 0:
                       quantity = pos_info['size']
                       self.add_log(f"     - 청산 시도: 종목 {stock_code}, 수량 {quantity}")
@@ -842,11 +805,9 @@ class TradingEngine:
               self.add_log("  - [KILL] 청산할 보유 포지션 없음.")
 
           self.add_log("🚨 Kill Switch 처리 완료. 엔진 종료 대기...")
-          # shutdown()은 finally 블록에서 호출되므로 여기서 기다림
 
       except Exception as e:
           self.add_log(f"🚨🚨🚨 [CRITICAL] Kill Switch 처리 중 심각한 오류 발생: {e} 🚨🚨🚨")
           self.add_log(traceback.format_exc())
           self.engine_status = 'ERROR'
-          # stop()은 이미 호출되었을 수 있으나 확실히 호출
           if not self._stop_event.is_set(): await self.stop()
