@@ -198,13 +198,12 @@ class KiwoomAPI:
             asyncio.create_task(self._receive_messages())
             await asyncio.sleep(1)
 
-            # --- 수정: TR 등록 시 account_no를 key로 사용 ---
             # '00', '04' TR은 계좌번호를 item(key)으로 사용해야 할 수 있음 (가이드 확인 필요)
             # 일단 가이드 예시처럼 ""를 사용, 문제가 되면 계좌번호로 변경
             if not self.account_no:
-                 self.add_log("❌ 실시간 TR 등록 실패: 계좌번호 설정 필요"); await self.disconnect_websocket(); return False
-            await self.register_realtime(tr_ids=['00', '04'], tr_keys=["", ""]) # 키움 가이드대로 item을 "" 로 설정
-            # --- 수정 끝 ---
+              self.add_log("❌ 실시간 TR 등록 실패: 계좌번호 설정 필요"); await self.disconnect_websocket(); return False
+            # ✅ 계좌 관련 TR('00', '04')만 우선 등록
+            await self.register_realtime(tr_ids=['00', '04'], tr_keys=["", ""])
             return True
 
         except websockets.exceptions.InvalidStatusCode as e:
@@ -221,7 +220,7 @@ class KiwoomAPI:
         return False
 
     async def _receive_messages(self):
-        """웹소켓 메시지 수신 및 처리 루프 (데이터 처리, PONG 자동 처리 기대)"""
+        """웹소켓 메시지 수신 및 처리 루프"""
         if not self.websocket or not self.websocket.open:
             self.add_log("⚠️ 메시지 수신 불가: 웹소켓 연결 안됨."); return
         self.add_log("👂 실시간 메시지 수신 대기 중...")
@@ -267,19 +266,50 @@ class KiwoomAPI:
                         if isinstance(realtime_data_list, list):
                             for item_data in realtime_data_list:
                                 data_type = item_data.get('type')
-                                item_code = item_data.get('item')
+                                item_code_raw = item_data.get('item', '') # 키움 'item' 사용
                                 values = item_data.get('values')
 
-                                if data_type and values and self.message_handler:
-                                    # 핸들러에 필요한 정보만 전달 (가이드 구조에 맞춰)
-                                    self.message_handler({
-                                        "trnm": "REAL", # trnm 명시
-                                        "type": data_type,
-                                        "item": item_code,
-                                        "values": values
-                                    })
-                                else:
-                                    self.add_log(f"⚠️ 실시간 데이터 항목 형식 오류: {item_data}")
+                                if not data_type or not values:
+                                    self.add_log(f"⚠️ 실시간 데이터 항목 형식 오류 (type/values 누락): {item_data}")
+                                    continue
+
+                                stock_code = None
+                                if item_code_raw:
+                                    stock_code = item_code_raw[1:] if item_code_raw.startswith('A') else item_code_raw
+                                    if stock_code.endswith(('_NX', '_AL')): stock_code = stock_code[:-3]
+
+                                # ✅ '1h' 타입 (VI 발동/해제) 처리 추가
+                                if data_type == '1h':
+                                    if stock_code and self.message_handler:
+                                        # 핸들러에 필요한 정보만 전달
+                                        self.message_handler({
+                                            "trnm": "REAL",
+                                            "type": data_type, # '1h'
+                                            "item": stock_code, # 정제된 종목 코드
+                                            "values": values # values 딕셔너리 전체 전달
+                                        })
+                                    else:
+                                         self.add_log(f"⚠️ VI(1h) 데이터 처리 불가 (코드:{stock_code}, 핸들러:{self.message_handler is not None}): {values}")
+
+                                # --- 기존 다른 타입 처리 ('0B', '0D', '00', '04') ---
+                                elif data_type in ['0B', '0D', '04']: # 잔고(04)도 stock_code 필요
+                                    if stock_code and self.message_handler:
+                                        self.message_handler({
+                                            "trnm": "REAL",
+                                            "type": data_type,
+                                            "item": stock_code,
+                                            "values": values
+                                        })
+                                elif data_type == '00': # 주문 체결은 stock_code 없어도 처리
+                                    if self.message_handler:
+                                         self.message_handler({
+                                            "trnm": "REAL",
+                                            "type": data_type,
+                                            "item": stock_code, # 있어도 전달, 없으면 None 전달
+                                            "values": values
+                                        })
+                                # --- 처리 끝 ---
+
                         else:
                             self.add_log(f"⚠️ 'REAL' 메시지 data 필드 오류: {data}")
 
@@ -314,28 +344,25 @@ class KiwoomAPI:
         if len(tr_ids) != len(tr_keys):
             self.add_log("❌ 실시간 등록 실패: ID(type)와 KEY(item) 개수가 일치하지 않음"); return
 
-        # --- 수정: data 리스트 구성 방식 (가이드 기반) ---
         # 가이드 예시: data: [{"item": ["005930"], "type": ["0B"]}, {"item": [""], "type": ["00"]}]
         data_payload = []
         grouped_items = {} # type별로 item들을 그룹화
 
         for tr_id, tr_key in zip(tr_ids, tr_keys):
-            # item이 필요없는 TR ('00', '04') 처리
+            # ✅ '1h'도 item(종목코드)이 필요한 TR로 처리
             if tr_id in ['00', '04']:
-                # 빈 문자열 item을 가진 항목 추가
                 data_payload.append({"item": [""], "type": [tr_id]})
-            # item이 필요한 TR 처리
-            else:
+            else: # '0B', '0D', '1h' 등 종목 코드가 필요한 경우
                 if tr_id not in grouped_items:
                     grouped_items[tr_id] = []
-                if tr_key: # 유효한 key만 추가
+                if tr_key:
                     grouped_items[tr_id].append(tr_key)
 
-        # 그룹화된 item들을 data_payload에 추가
         for tr_id, items in grouped_items.items():
-            if items: # item이 하나라도 있을 경우에만 추가
+            if items:
+                # ✅ type은 리스트가 아닌 단일 문자열로 전달 (API 문서 확인 필요, 여러개 동시 구독이 되는지?)
+                # 우선 가이드대로 type을 리스트로 유지
                 data_payload.append({"item": items, "type": [tr_id]})
-        # --- 수정 끝 ---
 
         if not data_payload:
             self.add_log("⚠️ 실시간 등록 요청할 유효한 데이터 없음.")
@@ -357,11 +384,11 @@ class KiwoomAPI:
         grouped_items = {}
         for tr_id, tr_key in zip(tr_ids, tr_keys):
             if tr_id in ['00', '04']: data_payload.append({"item": [""], "type": [tr_id]})
-            else:
+            else: # ✅ '1h' 포함
                 if tr_id not in grouped_items: grouped_items[tr_id] = []
                 if tr_key: grouped_items[tr_id].append(tr_key)
         for tr_id, items in grouped_items.items():
-            if items: data_payload.append({"item": items, "type": [tr_id]})
+            if items: data_payload.append({"item": items, "type": [tr_id]}) # ✅ type 리스트 유지
 
         if not data_payload: self.add_log("⚠️ 실시간 해지 요청할 유효한 데이터 없음."); return
 
@@ -464,7 +491,7 @@ class KiwoomAPI:
 
         try:
             # 수정된 body 사용
-            self.add_log(f"🔍 [API {tr_id}] 거래량 급증 요청 Body (수정됨): {body}")
+            self.add_log(f"🔍 [API {tr_id}] 거래량 급증 요청 Body: {body}")
             res = await self.client.post(full_url, headers=headers, json=body)
             res.raise_for_status(); data = res.json()
 
