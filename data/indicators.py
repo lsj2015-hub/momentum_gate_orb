@@ -159,21 +159,31 @@ def calculate_obi(total_bid_volume: Optional[int], total_ask_volume: Optional[in
         return None
 
 
-def get_strength(df: pd.DataFrame) -> Optional[float]:
+def get_strength(cumulative_buy_volume: int, cumulative_sell_volume: int) -> Optional[float]:
     """
-    체결강도를 계산하거나 가져옵니다. (❗️현재 임시 구현❗️)
-    실제 구현 시 API 조회 또는 WebSocket 데이터 활용 필요.
-    여기서는 DataFrame에 'strength' 컬럼이 있으면 마지막 값을 반환.
+    누적된 매수/매도 체결량을 기반으로 체결강도를 계산합니다.
+    체결강도 = (누적 매수 체결량 / 누적 매도 체결량) * 100
+
     Args:
-        df (pd.DataFrame): 'strength' 컬럼 포함 가능 DataFrame
+        cumulative_buy_volume (int): 특정 기간 동안 누적된 매수 체결량
+        cumulative_sell_volume (int): 특정 기간 동안 누적된 매도 체결량
+
     Returns:
-        Optional[float]: 체결강도 값, 없으면 None
+        Optional[float]: 계산된 체결강도 값 (%), 계산 불가 시 None
     """
-    # 임시 로직: DataFrame에 'strength' 컬럼이 있고 NaN이 아니면 반환
-    if df is not None and 'strength' in df.columns and not pd.isna(df['strength'].iloc[-1]):
-        strength_val = df['strength'].iloc[-1]
-        print(f"✅ Strength 값 확인 (DataFrame): {strength_val:.2f}")
-        return float(strength_val)
-    else:
-        print("⚠️ Strength 값 없음 (임시 구현). 실제 API 연동 필요.")
-        return None # 실제 구현 시 API 호출 결과 반환
+    if cumulative_sell_volume <= 0:
+        # 매도 체결량이 0이면 (매수만 있었거나 거래가 없었음)
+        if cumulative_buy_volume > 0:
+            print("⚠️ Strength 계산: 매도 체결량 0 (매수 우위 극단값)")
+            return 1000.0 # 극단적인 매수 우위 상태 (매우 큰 값 또는 다른 값으로 정의 가능)
+        else:
+            # print("⚠️ Strength 계산 불가: 매수/매도 누적 체결량 모두 0") # 로그 너무 많을 수 있어 주석 처리
+            return None # 거래 자체가 없는 경우
+
+    try:
+        strength = (cumulative_buy_volume / cumulative_sell_volume) * 100
+        # print(f"✅ Strength 계산 완료: {strength:.2f}% (매수:{cumulative_buy_volume}/매도:{cumulative_sell_volume})") # 로그 너무 많을 수 있어 주석 처리
+        return strength
+    except Exception as e:
+        print(f"❌ Strength 계산 중 오류: {e}")
+        return None

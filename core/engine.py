@@ -22,7 +22,7 @@ class TradingEngine:
   """웹소켓 기반 실시간 다중 종목 트레이딩 로직 관장 엔진"""
   def __init__(self):
     self.config = config # 전역 config 객체 사용
-    self.positions: Dict[str, Dict] = {} # {'종목코드': {'stk_cd': ..., 'entry_price': ..., 'size': ..., 'status': 'IN_POSITION'|'PENDING_ENTRY'|'PENDING_EXIT'|'ERROR_...', 'order_no': ..., 'partial_profit_taken': False, ...}}
+    self.positions: Dict[str, Dict] = {} 
     self.logs: List[str] = [] # 최근 로그 저장 (UI 표시용)
     self.api: Optional[KiwoomAPI] = None # KiwoomAPI 인스턴스
     self._stop_event = asyncio.Event() # 엔진 종료 제어 이벤트
@@ -31,6 +31,7 @@ class TradingEngine:
     self.candidate_stock_codes: List[str] = []
     self.candidate_stocks_info: List[Dict[str, str]] = []
     self.realtime_data: Dict[str, Dict] = {}
+    self.cumulative_volumes: Dict[str, Dict] = {}
     self.subscribed_codes: Set[str] = set()
     self.engine_status = 'STOPPED'
     self.last_stock_tick_time: Dict[str, datetime] = {}
@@ -48,35 +49,42 @@ class TradingEngine:
     if len(self.logs) > 100:
         self.logs.pop()
 
-  # --- 👇 VI 상태 처리 함수 추가 ---
+  # --- 👇 VI 상태 처리 함수 수정 ---
   async def _process_vi_update(self, stock_code: str, values: Dict):
       """실시간 VI 발동/해제('1h') 데이터 처리 (비동기)"""
       try:
-          # 키움 API 문서 '1h' 응답 필드 참조
+          # --- 키움 API 문서 '1h' 응답 필드 참조 ---
           vi_status_flag = values.get('9068') # VI발동구분
-          vi_type = values.get('1225')       # VI적용구분
+          vi_type = values.get('1225')       # VI적용구분 (정적/동적/동적+정적)
           vi_direction = values.get('9069')  # 발동방향구분 (1:상승, 2:하락)
-          vi_release_time = values.get('1224') # VI 해제 시각 (HHMMSS)
+          vi_release_time_raw = values.get('1224') # VI 해제 시각 (HHMMSS)
+          # --- 참조 끝 ---
+
+          # VI 해제 시각 포맷팅 (HH:MM:SS)
+          vi_release_time = f"{vi_release_time_raw[:2]}:{vi_release_time_raw[2:4]}:{vi_release_time_raw[4:]}" if vi_release_time_raw and len(vi_release_time_raw) == 6 else "N/A"
 
           is_vi_activated = False
-          status_text = "해제"
+          status_text = "해제" # 기본값
 
-          # --- ⚠️ 실제 키움 API 명세에 따른 발동/해제 판단 로직 구현 필요 ---
-          # 예시: '발동' 관련 코드 (예: '1', '2', '5')이면 True 설정
-          if vi_status_flag in ['1', '2', '5']: # ❗️ 실제 발동 코드로 변경해야 함
+          # --- VI 발동/해제 판단 로직 ---
+          # ❗️ 참고: 문서에 '9068'의 정확한 발동/해제 값 명시가 부족하여,
+          #   일반적인 경우(값이 있으면 발동, 없거나 특정 값이면 해제)를 가정합니다.
+          #   실제 API 테스트를 통해 발동/해제 시 '9068' 값을 확인하고 조정해야 합니다.
+          if vi_status_flag: # 값이 존재하면 발동으로 간주 (임시 로직)
               is_vi_activated = True
-              direction_text = '상승' if vi_direction == '1' else ('하락' if vi_direction == '2' else '?')
-              status_text = f"발동({vi_type}, {direction_text})"
-          # --- ⚠️ 판단 로직 끝 ---
+              direction_text = '⬆️상승' if vi_direction == '1' else ('⬇️하락' if vi_direction == '2' else '?')
+              status_text = f"발동 ({vi_type}, {direction_text})"
+          # --- 판단 로직 끝 ---
 
           # 엔진의 VI 상태 업데이트
           self.vi_status[stock_code] = is_vi_activated
+          # 로그 메시지에 해제 예정 시각 포함
           self.add_log(f"⚡️ [{stock_code}] VI 상태 업데이트: {status_text} (해제 예정: {vi_release_time})")
 
       except Exception as e:
           self.add_log(f"  🚨 [RT_VI] 실시간 VI({stock_code}) 처리 오류: {e}")
-          self.add_log(traceback.format_exc())
-  # --- 👆 VI 상태 처리 함수 끝 ---
+          self.add_log(traceback.format_exc()) # 상세 오류 로그 추가
+  # --- 👆 VI 상태 처리 함수 수정 끝 ---
 
   # --- 👇 VI 상태 확인 함수 추가 ---
   def check_vi_status(self, stock_code: str) -> bool:
@@ -150,6 +158,15 @@ class TradingEngine:
                   else: self.add_log(f"  ⚠️ [{stock_code}] OBI 계산 위한 호가 잔량 추출/변환 불가.")
               except Exception as obi_e: self.add_log(f"  🚨 [{stock_code}] OBI 계산 준비 중 오류: {obi_e}")
           else: self.add_log(f"  ⚠️ [{stock_code}] 호가 데이터 없음. OBI 계산 불가.")
+
+          # ✅ 체결강도 계산 준비
+          cumulative_vols = self.cumulative_volumes.get(stock_code) # 누적량 가져오기
+          strength_val = None
+          if cumulative_vols:
+              # ✅ get_strength 함수 호출 방식 변경 (누적량 전달)
+              strength_val = get_strength(cumulative_vols['buy_vol'], cumulative_vols['sell_vol'])
+          else:
+              self.add_log(f"  ⚠️ [{stock_code}] 체결강도 계산 위한 누적 데이터 없음.")
 
           # --- 5. 필수 지표 확인 ---
           if orb_levels['orh'] is None: self.add_log(f"  ⚠️ [{stock_code}] ORH 계산 불가."); return
@@ -365,16 +382,51 @@ class TradingEngine:
       except Exception as e: self.add_log(f"🚨 실시간 콜백 오류: {e}"); self.add_log(traceback.format_exc())
 
   async def _process_realtime_execution(self, stock_code: str, values: Dict):
-      """실시간 체결(0B) 처리"""
+      """실시간 체결(0B) 처리 및 체결강도 계산용 데이터 누적"""
       try:
-          last_price_str = values.get('10'); exec_vol_str = values.get('15')
-          if not last_price_str or not exec_vol_str: return
+          last_price_str = values.get('10') # 현재가
+          exec_vol_signed_str = values.get('15') # 거래량 (+/- 포함)
+          exec_time_str = values.get('20') # 체결시간 (HHMMSS)
+
+          if not last_price_str or not exec_vol_signed_str or not exec_time_str:
+              # self.add_log(f"  ⚠️ [RT_EXEC] ({stock_code}) 필수 값 누락: {values}") # 로그 너무 많을 수 있어 주석 처리
+              return
+
           last_price = float(last_price_str.replace('+','').replace('-','').strip())
-          exec_vol_signed = int(exec_vol_str.strip())
+          exec_vol_signed = int(exec_vol_signed_str.strip())
+          now = datetime.now()
+
+          # --- 실시간 데이터 저장 (기존 로직) ---
           if stock_code not in self.realtime_data: self.realtime_data[stock_code] = {}
-          self.realtime_data[stock_code].update({ 'last_price': last_price, 'timestamp': datetime.now() }) # 필요한 값만 간소화
-      except (ValueError, KeyError): pass
-      except Exception as e: self.add_log(f"  🚨 RT_EXEC ({stock_code}) 오류: {e}")
+          self.realtime_data[stock_code].update({ 'last_price': last_price, 'timestamp': now })
+
+          # --- 체결강도 계산 위한 누적량 업데이트 ---
+          if stock_code not in self.cumulative_volumes:
+              self.cumulative_volumes[stock_code] = {'buy_vol': 0, 'sell_vol': 0, 'timestamp': now}
+
+          # 1분 지났으면 누적량 초기화 (최근 1분 체결강도)
+          last_update = self.cumulative_volumes[stock_code]['timestamp']
+          if (now - last_update).total_seconds() > 60:
+              # self.add_log(f"  🔄 [{stock_code}] 체결강도 누적량 초기화 (1분 경과)") # 디버깅 시 주석 해제
+              self.cumulative_volumes[stock_code] = {'buy_vol': 0, 'sell_vol': 0, 'timestamp': now}
+
+          current_cumulative = self.cumulative_volumes[stock_code]
+
+          if exec_vol_signed > 0: # 매수 체결
+              current_cumulative['buy_vol'] += exec_vol_signed
+          elif exec_vol_signed < 0: # 매도 체결
+              current_cumulative['sell_vol'] += abs(exec_vol_signed)
+          # 0은 무시
+
+          current_cumulative['timestamp'] = now
+          # self.add_log(f"  📊 [{stock_code}] 누적: 매수={current_cumulative['buy_vol']}, 매도={current_cumulative['sell_vol']}") # 디버깅 시 주석 해제
+
+
+      except (ValueError, KeyError) as e:
+          self.add_log(f"  🚨 [RT_EXEC] ({stock_code}) 데이터 처리 오류: {e}, Data: {values}")
+      except Exception as e:
+          self.add_log(f"  🚨 [RT_EXEC] ({stock_code}) 예상치 못한 오류: {e}")
+          self.add_log(traceback.format_exc()) # 상세 오류 로깅 추가
 
   async def _process_realtime_orderbook(self, stock_code: str, values: Dict):
       """실시간 호가(0D) 처리"""
