@@ -1,4 +1,3 @@
-# engine.py
 import asyncio
 import pandas as pd
 from datetime import datetime, timedelta
@@ -13,7 +12,7 @@ from gateway.kiwoom_api import KiwoomAPI
 # 데이터 처리 및 지표 계산 import
 from data.manager import preprocess_chart_data
 # indicators.py 에서 add_vwap, calculate_orb 임포트
-from data.indicators import add_vwap, calculate_orb # , add_ema # 다음 단계에서 추가
+from data.indicators import add_vwap, calculate_orb, add_ema, calculate_rvol, calculate_obi
 # 전략 관련 import
 from strategy.momentum_orb import check_breakout_signal
 from strategy.risk_manager import manage_position
@@ -48,6 +47,81 @@ class TradingEngine:
     self.logs.insert(0, log_msg) # 리스트 맨 앞에 추가 (최신 로그가 위로)
     if len(self.logs) > 100: # 로그 최대 개수 제한 (예: 100개)
         self.logs.pop() # 가장 오래된 로그 제거
+
+  async def process_tick(self):
+    """매 틱마다 API 인스턴스를 생성하고 작업을 수행한 후 정리합니다."""
+    self.add_log("새로운 틱 처리 시작")
+
+    # ⭐️ 매 틱마다 새로운 API 클라이언트 생성
+    api = KiwoomAPI()
+    try:
+      # 1. 데이터 수집 및 가공
+      # 대상 종목의 1분봉 데이터를 가져옵니다.
+      raw_data = await api.fetch_minute_chart(self.target_stock, timeframe=1)
+      if not (raw_data and raw_data.get("stk_min_pole_chart_qry")):
+        self.add_log("❗️ 데이터를 가져오지 못했습니다.")
+        return # 데이터 없으면 처리 중단
+
+      # API 응답 데이터를 DataFrame으로 변환하고 전처리합니다.
+      df = preprocess_chart_data(raw_data["stk_min_pole_chart_qry"])
+      if df is None or df.empty:
+        self.add_log("❗️ 데이터프레임 변환에 실패했습니다.")
+        return # DataFrame 변환 실패 시 처리 중단
+
+      # 2. 보조지표 계산
+      add_vwap(df) # VWAP 계산 및 추가
+      # --- EMA 계산 로직 추가 ---
+      add_ema(df) # EMA(9, 20) 계산 및 추가
+      # --------------------------
+      orb_levels = calculate_orb(df, timeframe=config.strategy.orb_timeframe) # ORB 계산
+      current_price = df['close'].iloc[-1] # 현재가 추출
+
+      # 로그에 주요 정보 출력
+      # EMA 값도 로그에 추가 (옵션) - 마지막 EMA 값 확인
+      ema9 = df['EMA_9'].iloc[-1] if 'EMA_9' in df.columns else 'N/A'
+      ema20 = df['EMA_20'].iloc[-1] if 'EMA_20' in df.columns else 'N/A'
+      self.add_log(f"현재가: {current_price}, ORH: {orb_levels['orh']}, ORL: {orb_levels['orl']}, EMA9: {ema9:.2f}, EMA20: {ema20:.2f}")
+
+      # 3. 포지션 상태에 따른 의사결정
+      if not self.position: # 현재 포지션이 없으면
+        # 매수 신호 확인
+        signal = check_breakout_signal(
+          current_price, orb_levels, config.strategy.breakout_buffer
+        )
+        if signal == "BUY":
+          self.add_log("🔥 매수 신호 포착! 주문을 실행합니다.")
+          # 시장가 매수 주문 실행 (예: 1주)
+          order_result = await api.create_buy_order(self.target_stock, quantity=1)
+          if order_result and order_result.get('return_code') == 0:
+            # 주문 성공 시 포지션 상태 업데이트
+            self.position = {
+              'stk_cd': self.target_stock,
+              'entry_price': current_price,
+              'size': 1,
+              'order_no': order_result.get('ord_no') # 주문 번호 저장 (필요시)
+            }
+            self.add_log(f"➡️ 포지션 진입 완료: {self.position}")
+          # else: # 주문 실패 처리 (필요시 로그 추가 등)
+          #   self.add_log(f"❌ 매수 주문 실패: {order_result}")
+
+      else: # 현재 포지션이 있으면
+        # 익절 또는 손절 신호 확인
+        signal = manage_position(self.position, current_price)
+        if signal in ["TAKE_PROFIT", "STOP_LOSS"]:
+          self.add_log(f"🎉 {signal} 조건 충족! 매도 주문을 실행합니다.")
+          # 시장가 매도 주문 실행 (보유 수량만큼)
+          order_result = await api.create_sell_order(self.target_stock, self.position.get('size', 0))
+          if order_result and order_result.get('return_code') == 0:
+            # 주문 성공 시 포지션 상태 초기화
+            self.add_log(f"⬅️ 포지션 청산 완료: {self.position}")
+            self.position = {} # 포지션 없음 상태로 변경
+          # else: # 주문 실패 처리
+          #   self.add_log(f"❌ 매도 주문 실패: {order_result}")
+
+    finally:
+      # ⭐️ 작업이 끝나면 항상 API 클라이언트를 닫아줍니다.
+      await api.close()
+      self.add_log("틱 처리 완료 및 API 연결 종료")
 
   async def start(self):
     """엔진 시작: API 인스턴스 생성, 웹소켓 연결, 메인 루프 실행"""
@@ -454,7 +528,6 @@ class TradingEngine:
           self.add_log(f"🚨🚨🚨 [CRITICAL] 주문 체결 처리(_process_execution_update) 중 심각한 오류: {e} | Data: {str(exec_data)[:200]}... 🚨🚨🚨")
           self.add_log(traceback.format_exc())
 
-  # --- 👇 _process_balance_update 함수 시그니처 수정 ---
   async def _process_balance_update(self, stock_code: str, balance_data: Dict):
   # --- 👆 수정 끝 ---
       """실시간 잔고(TR ID: 04) 데이터 처리 (비동기)"""
@@ -629,119 +702,206 @@ class TradingEngine:
       current_vwap = None # VWAP 값 저장 변수
       df = None # DataFrame 초기화
       realtime_available = False
+      orderbook_data = None # 호가 데이터 저장 변수 추가
+      obi = None # OBI 값 저장 변수 추가
+      rvol = None # RVOL 값 저장 변수 추가
 
       # --- 1. 실시간 데이터 우선 확인 ---
       if stock_code in self.realtime_data:
           realtime_info = self.realtime_data[stock_code]
           last_update_time = realtime_info.get('timestamp')
+          # 실시간 데이터가 10초 이내에 업데이트되었는지 확인
           if last_update_time and (datetime.now() - last_update_time).total_seconds() < 10:
               current_price = realtime_info.get('last_price')
               if current_price: realtime_available = True
 
-      # --- 2. REST API 호출 (실시간 없거나, 지표 계산 필요 시) ---
-      # 지표 계산(ORB, VWAP 등)을 위해선 분봉 데이터(df)가 필요
-      # 실시간 가격만 있고 df가 없거나, 실시간 가격이 없는 경우 호출
+      # --- 2. REST API 호출 ---
+      # API 객체가 없으면 함수 종료
+      if not self.api:
+          self.add_log(f"  ⚠️ [{stock_code}] API 객체 없음. 데이터 조회 불가.")
+          return
+
+      # 2.1 분봉 데이터 조회 (지표 계산 및 현재가 없을 때)
+      # 실시간 가격 정보가 없거나, DataFrame이 아직 생성되지 않은 경우 분봉 데이터 조회
       if not realtime_available or df is None:
           # self.add_log(f"   -> [{stock_code}] 분봉 데이터 API 호출...") # 필요시 주석 해제
-          if not self.api: self.add_log(f"  ⚠️ [{stock_code}] API 없음. 분봉 조회 불가."); return
           raw_data = await self.api.fetch_minute_chart(stock_code, timeframe=1)
           if raw_data and raw_data.get('return_code') == 0:
+              # API 응답 데이터를 DataFrame으로 변환 및 전처리
               df = preprocess_chart_data(raw_data.get("stk_min_pole_chart_qry", []))
               if df is not None and not df.empty:
-                  if not realtime_available: # 실시간 가격 없던 경우만 df 가격 사용
+                  # 실시간 가격 정보가 없었을 경우 DataFrame의 마지막 종가를 현재가로 사용
+                  if not realtime_available:
                       current_price = df['close'].iloc[-1]
               else:
                   df = None # 빈 DataFrame이면 None으로 처리
                   # self.add_log(f"  ⚠️ [{stock_code}] 분봉 데이터프레임 변환 실패 또는 비어있음.")
-          # else: # fetch_minute_chart 내부에서 오류 로그 처리됨
+          # else: fetch_minute_chart 내부에서 오류 로그가 처리됨
+
+      # --- 👇 2.2 호가 데이터 조회 (OBI 계산용) ---
+      orderbook_raw_data = await self.api.fetch_orderbook(stock_code)
+      if orderbook_raw_data and orderbook_raw_data.get('return_code') == 0:
+          orderbook_data = orderbook_raw_data # 성공 시 데이터 저장
+      # --- 👆 호가 데이터 조회 끝 ---
 
       # --- 3. 현재가 최종 확인 ---
+      # 실시간 데이터나 API 조회를 통해 현재가를 얻지 못했으면 처리 중단
       if current_price is None:
           self.add_log(f"  ⚠️ [{stock_code}] 현재가 확인 불가 (실시간/API 모두). Tick 처리 중단.")
           return
 
-      # --- 4. 지표 계산 (DataFrame 필요) ---
-      orb_levels = pd.Series({'orh': None, 'orl': None})
-      if df is not None: # DataFrame이 있을 때만 계산
-          add_vwap(df)
-          orb_levels = calculate_orb(df, timeframe=getattr(self.config.strategy, 'orb_timeframe', 15))
+      # --- 4. 지표 계산 ---
+      orb_levels = pd.Series({'orh': None, 'orl': None}) # ORB 초기화
+      rvol = None # RVOL 초기화
+
+      # DataFrame이 유효할 때만 지표 계산 수행
+      if df is not None:
+          add_vwap(df) # VWAP 계산
+          add_ema(df) # EMA 계산
+          orb_levels = calculate_orb(df, timeframe=getattr(self.config.strategy, 'orb_timeframe', 15)) # ORB 계산
+          # VWAP 값 추출 (NaN 이 아닐 경우)
           current_vwap = df['VWAP'].iloc[-1] if 'VWAP' in df.columns and not pd.isna(df['VWAP'].iloc[-1]) else None
-          # --- EMA 추가 ---
-          # add_ema(df, short_period=9, long_period=20)
-          # --- OBI, RVOL 계산 (다음 단계) ---
-          # realtime_info = self.realtime_data.get(stock_code)
-          # obi = calculate_obi(realtime_info.get('total_bid_vol'), realtime_info.get('total_ask_vol')) if realtime_info else None
-          # rvol = calculate_rvol(df['volume'].iloc[-1], await self.get_historical_avg_volume(stock_code)) if not df.empty else None
+
+          # --- 👇 RVOL 계산 호출 (DataFrame 전달) ---
+          rvol_window = getattr(self.config.strategy, 'rvol_window', 20) # 설정값 사용 (없으면 20)
+          rvol = calculate_rvol(df, window=rvol_window) # 수정된 함수 호출
+          # --- 👆 RVOL 계산 호출 끝 ---
       else:
-          self.add_log(f"  ⚠️ [{stock_code}] 지표 계산용 DataFrame 없음. ORB/VWAP 등 계산 불가.")
+          self.add_log(f"  ⚠️ [{stock_code}] 지표 계산용 DataFrame 없음. ORB/VWAP/EMA/RVOL 등 계산 불가.")
+
+      # --- 👇 OBI 계산 (호가 데이터 필요) ---
+      if orderbook_data:
+          try:
+              # API 응답에서 총매수/매도 잔량 키('tot_buy_req', 'tot_sel_req')로 값 추출
+              total_bid_vol_str = orderbook_data.get('tot_buy_req')
+              total_ask_vol_str = orderbook_data.get('tot_sel_req')
+
+              # 문자열 값을 정수로 변환 (값이 없거나 숫자가 아니면 None)
+              total_bid_vol = int(total_bid_vol_str.strip()) if total_bid_vol_str and total_bid_vol_str.strip().lstrip('-').isdigit() else None
+              total_ask_vol = int(total_ask_vol_str.strip()) if total_ask_vol_str and total_ask_vol_str.strip().lstrip('-').isdigit() else None
+
+              # 두 값 모두 유효할 때 OBI 계산 함수 호출
+              if total_bid_vol is not None and total_ask_vol is not None:
+                 obi = calculate_obi(total_bid_vol, total_ask_vol)
+              else:
+                 self.add_log(f"  ⚠️ [{stock_code}] 호가 데이터에서 총 잔량 추출 실패 또는 숫자 변환 불가. OBI 계산 스킵.")
+          except Exception as obi_e: # OBI 계산 중 발생할 수 있는 예외 처리
+              self.add_log(f"  🚨 [{stock_code}] OBI 계산 준비 중 오류: {obi_e}")
+      else:
+          # 호가 데이터 조회 실패 시 로그
+          self.add_log(f"  ⚠️ [{stock_code}] 호가 데이터 없음. OBI 계산 불가.")
+      # --- 👆 OBI 계산 끝 ---
 
       # --- 5. 필수 지표 확인 (ORB) ---
+      # ORB 상단값(orh)이 없으면 전략 실행 불가
       if orb_levels['orh'] is None:
            self.add_log(f"  ⚠️ [{stock_code}] 필수 지표(ORH) 계산 불가. Tick 처리 중단.")
            return
 
-      # --- 6. 전략 로직 실행 ---
-      position_info = self.positions.get(stock_code)
-      current_status = position_info.get('status') if position_info else 'SEARCHING'
+      # --- 로그 출력 업데이트 (OBI, RVOL 포함) ---
+      # DataFrame 이 있을 경우 EMA 값 추출, 없으면 'N/A'
+      ema9_val = df['EMA_9'].iloc[-1] if df is not None and 'EMA_9' in df.columns and not pd.isna(df['EMA_9'].iloc[-1]) else None
+      ema20_val = df['EMA_20'].iloc[-1] if df is not None and 'EMA_20' in df.columns and not pd.isna(df['EMA_20'].iloc[-1]) else None
+      # 값 포맷팅 (소수점 둘째자리 또는 'N/A')
+      ema9_str = f"{ema9_val:.2f}" if ema9_val is not None else "N/A"
+      ema20_str = f"{ema20_val:.2f}" if ema20_val is not None else "N/A"
+      rvol_str = f"{rvol:.2f}%" if rvol is not None else "N/A"
+      obi_str = f"{obi:.2f}%" if obi is not None else "N/A"
+      vwap_str = f"{current_vwap:.2f}" if current_vwap is not None else "N/A"
+      # ORB 값 포맷팅 (정수 또는 'N/A')
+      orh_str = f"{orb_levels['orh']:.0f}" if orb_levels['orh'] is not None else "N/A"
+      orl_str = f"{orb_levels['orl']:.0f}" if orb_levels['orl'] is not None else "N/A"
 
+      # 최종 로그 출력
+      self.add_log(f"📊 [{stock_code}] 현재가:{current_price:.0f}, ORH:{orh_str}, ORL:{orl_str}, VWAP:{vwap_str}, EMA9:{ema9_str}, EMA20:{ema20_str}, RVOL:{rvol_str}, OBI:{obi_str}")
+      # --- 로그 끝 ---
+
+      # --- 6. 전략 로직 실행 ---
+      position_info = self.positions.get(stock_code) # 현재 종목의 포지션 정보 가져오기
+      current_status = position_info.get('status') if position_info else 'SEARCHING' # 포지션 없으면 'SEARCHING' 상태
+
+      # 주문이 이미 진행 중인 상태(PENDING_ENTRY, PENDING_EXIT)면 추가 작업 없이 종료
       if current_status in ['PENDING_ENTRY', 'PENDING_EXIT']:
-          return # 주문 진행 중이면 건너뜀
+          return
 
       try:
           # --- 진입 조건 (SEARCHING 상태) ---
           if current_status == 'SEARCHING':
-              if stock_code in self.candidate_stock_codes: # 스크리닝 후보일 때만 진입 시도
+              # 스크리닝된 후보 종목 목록에 해당 종목이 있을 때만 진입 시도
+              if stock_code in self.candidate_stock_codes:
+                  # 돌파 신호 확인
                   signal = check_breakout_signal(
                       current_price, orb_levels, getattr(self.config.strategy, 'breakout_buffer', 0.15)
                   )
-                  if signal == "BUY":
+                  # --- 👇 진입 필터 추가 (예시: RVOL > 130%, OBI > 150%) ---
+                  # 설정 파일에서 필터 임계값 가져오기 (없으면 기본값 사용)
+                  rvol_threshold = getattr(self.config.strategy, 'entry_min_rvol', 130.0)
+                  obi_threshold = getattr(self.config.strategy, 'entry_min_obi', 150.0)
+                  # 필터 조건 충족 여부 확인 (RVOL, OBI 값이 유효하고 임계값 이상인지)
+                  rvol_ok = rvol is not None and rvol >= rvol_threshold
+                  obi_ok = obi is not None and obi >= obi_threshold
+
+                  # 매수 신호가 발생했고, RVOL과 OBI 필터 조건을 모두 만족하는 경우
+                  if signal == "BUY" and rvol_ok and obi_ok:
+                      # 주문 수량 계산
                       order_qty = await self.calculate_order_quantity(current_price)
-                      if order_qty > 0:
-                          self.add_log(f"🔥 [{stock_code}] 매수 신호! (현재가 {current_price:.0f}, ORH {orb_levels['orh']:.0f}, Buffer {getattr(self.config.strategy, 'breakout_buffer', 0.15)}%)")
+                      if order_qty > 0: # 주문 수량이 0보다 클 때만 주문 실행
+                          self.add_log(f"🔥 [{stock_code}] 매수 신호 + 필터 충족! (RVOL:{rvol_str}, OBI:{obi_str})")
                           self.add_log(f"  -> [{stock_code}] 매수 주문 API 호출 시도 ({order_qty}주)...")
+                          # 매수 주문 API 호출
                           order_result = await self.api.create_buy_order(stock_code, quantity=order_qty)
+                          # 주문 결과 확인
                           if order_result and order_result.get('return_code') == 0:
-                              order_no = order_result.get('ord_no')
+                              order_no = order_result.get('ord_no') # 주문 번호 저장
                               self.add_log(f"   ➡️ [{stock_code}] 매수 주문 접수 완료: {order_no}")
+                              # 포지션 상태 업데이트 (PENDING_ENTRY)
                               self.positions[stock_code] = {
                                   'stk_cd': stock_code, 'status': 'PENDING_ENTRY', 'order_no': order_no,
                                   'original_order_qty': order_qty, 'filled_qty': 0, 'filled_value': 0.0
                               }
-                          else:
+                          else: # 주문 실패 시 로그 기록
                               error_msg = order_result.get('return_msg', '주문 실패') if order_result else 'API 호출 실패'
                               self.add_log(f"   ❌ [{stock_code}] 매수 주문 실패: {error_msg}")
-                      # else: # calculate_order_quantity 내부에서 이미 로그 기록
-                      #     self.add_log(f"   - [{stock_code}] 주문 수량이 0이므로 매수 주문 실행 안 함.")
+                  # 매수 신호는 발생했으나 필터 조건 미충족 시 로그 기록
+                  elif signal == "BUY" and (not rvol_ok or not obi_ok):
+                       self.add_log(f"   ⚠️ [{stock_code}] 매수 신호 발생했으나 필터 미충족 (RVOL:{rvol_str} {'✅' if rvol_ok else '❌'}, OBI:{obi_str} {'✅' if obi_ok else '❌'}). 진입 보류.")
+                  # --- 👆 진입 필터 끝 ---
 
           # --- 청산 조건 (IN_POSITION 상태) ---
+          # 현재 포지션을 보유 중('IN_POSITION')인 경우 청산 조건 확인
           elif current_status == 'IN_POSITION' and position_info:
-            signal = manage_position(position_info, current_price, current_vwap) # current_vwap 전달
-            if signal:
-                log_prefix = "💰" if signal == "TAKE_PROFIT" else ("📉" if signal == "VWAP_STOP_LOSS" else "🛑")
-                self.add_log(f"{log_prefix} 청산 신호({signal})! [{stock_code}] 매도 주문 실행 (현재가 {current_price:.0f}).")
-                sell_qty = position_info.get('size', 0)
-                if sell_qty > 0:
-                    order_result = await self.api.create_sell_order(stock_code, quantity=sell_qty)
-                    if order_result and order_result.get('return_code') == 0:
-                        order_no = order_result.get('ord_no')
-                        self.add_log(f"   ➡️ [{stock_code}] 매도 주문 접수 완료: {order_no}")
-                        position_info.update({
-                            'status': 'PENDING_EXIT', 'order_no': order_no,
-                            'exit_signal': signal, 'original_size_before_exit': sell_qty,
-                            'filled_qty': 0, 'filled_value': 0.0
-                        })
-                    else:
-                        error_msg = order_result.get('return_msg', '주문 실패') if order_result else 'API 호출 실패'
-                        self.add_log(f"   ❌ [{stock_code}] 매도 주문 실패: {error_msg}")
-                        position_info['status'] = 'ERROR_LIQUIDATION' # 청산 실패 시 에러 상태
-                else:
-                    self.add_log(f"   ⚠️ [{stock_code}] 청산할 수량 없음 ({sell_qty}). 포지션 정보 오류 가능성.")
-                    self.positions.pop(stock_code, None) # 오류 상태 포지션 제거
-                    await self._unsubscribe_realtime_stock(stock_code) # 구독 해지
+              # 리스크 관리 함수 호출 (익절/손절/VWAP 이탈 확인)
+              signal = manage_position(position_info, current_price, current_vwap) # current_vwap 전달됨
+              if signal: # 청산 신호가 발생하면
+                  # 신호 종류에 따라 로그 메시지 접두사 설정
+                  log_prefix = "💰" if signal == "TAKE_PROFIT" else ("📉" if signal == "VWAP_STOP_LOSS" else "🛑")
+                  self.add_log(f"{log_prefix} 청산 신호({signal})! [{stock_code}] 매도 주문 실행 (현재가 {current_price:.0f}).")
+                  sell_qty = position_info.get('size', 0) # 보유 수량 확인
+                  if sell_qty > 0: # 보유 수량이 0보다 크면
+                      # 매도 주문 API 호출
+                      order_result = await self.api.create_sell_order(stock_code, quantity=sell_qty)
+                      # 주문 결과 확인
+                      if order_result and order_result.get('return_code') == 0:
+                          order_no = order_result.get('ord_no')
+                          self.add_log(f"   ➡️ [{stock_code}] 매도 주문 접수 완료: {order_no}")
+                          # 포지션 상태 업데이트 (PENDING_EXIT)
+                          position_info.update({
+                              'status': 'PENDING_EXIT', 'order_no': order_no,
+                              'exit_signal': signal, 'original_size_before_exit': sell_qty,
+                              'filled_qty': 0, 'filled_value': 0.0
+                          })
+                      else: # 주문 실패 시 로그 기록 및 에러 상태 변경
+                          error_msg = order_result.get('return_msg', '주문 실패') if order_result else 'API 호출 실패'
+                          self.add_log(f"   ❌ [{stock_code}] 매도 주문 실패: {error_msg}")
+                          position_info['status'] = 'ERROR_LIQUIDATION'
+                  else: # 청산할 수량이 없을 경우 (오류 상황)
+                      self.add_log(f"   ⚠️ [{stock_code}] 청산할 수량 없음 ({sell_qty}). 포지션 정보 오류 가능성.")
+                      self.positions.pop(stock_code, None) # 해당 포지션 정보 삭제
+                      await self._unsubscribe_realtime_stock(stock_code) # 실시간 구독 해지
 
-      except Exception as e:
+      except Exception as e: # 예상치 못한 오류 발생 시 로그 기록
           self.add_log(f"🚨🚨🚨 [CRITICAL] 개별 Tick 처리({stock_code}) 중 예상치 못한 심각한 오류 발생: {e} 🚨🚨🚨")
-          self.add_log(traceback.format_exc())
+          self.add_log(traceback.format_exc()) # 상세 오류 스택 추적
 
   async def calculate_order_quantity(self, current_price: float) -> int:
       """주문 가능 현금과 설정된 투자 금액을 기반으로 주문 수량 계산"""

@@ -622,6 +622,44 @@ class KiwoomAPI:
         except httpx.RequestError as e: self.add_log(f"❌ [API {tr_id}] 예수금 조회 네트워크 오류: {e}"); return {'return_code': -1, 'return_msg': str(e)}
         except Exception as e: self.add_log(f"❌ [API {tr_id}] 예수금 조회 중 예상치 못한 오류: {e}"); print(traceback.format_exc()); return {'return_code': -99, 'return_msg': str(e)}
 
+    # --- 👇 주식 호가 데이터 요청 함수 추가 ---
+    async def fetch_orderbook(self, stock_code: str) -> Optional[Dict]:
+      """주식 호가 잔량 데이터를 요청합니다. (API ID: ka10004)"""
+      url = "/api/dostk/mrkcond" # API 문서상 URL 확인 필요 (ka10004)
+      tr_id = "ka10004" # API ID
+
+      try:
+        headers = await self._get_headers(tr_id)
+        body = {"stk_cd": stock_code}
+
+        res = await self.client.post(f"{self.base_url}{url}", headers=headers, json=body)
+        res.raise_for_status() # HTTP 오류 발생 시 예외 발생
+
+        data = res.json()
+        # API 응답 구조 확인 (예: return_code가 있는지)
+        if data.get('return_code') == 0:
+            self.add_log(f"✅ [{stock_code}] 호가 데이터 조회 성공") # add_log 대신 print 사용
+            # print(f"✅ [{stock_code}] 호가 데이터 조회 성공")
+            return data # 성공 시 전체 응답 데이터 반환
+        else:
+            error_msg = data.get('return_msg', '알 수 없는 오류')
+            # print(f"❌ [{stock_code}] 호가 데이터 조회 실패: {error_msg}")
+            self.add_log(f"❌ [{stock_code}] 호가 데이터 조회 실패: {error_msg}") # add_log 대신 print 사용
+            return None
+
+      except httpx.HTTPStatusError as e:
+        try:
+            error_data = e.response.json()
+            error_msg = error_data.get('return_msg', e.response.text)
+        except json.JSONDecodeError:
+            error_msg = e.response.text
+        # print(f"❌ [{stock_code}] 호가 데이터 조회 실패 (HTTP 오류): {e.response.status_code} - {error_msg}")
+        self.add_log(f"❌ [{stock_code}] 호가 데이터 조회 실패 (HTTP 오류): {e.response.status_code} - {error_msg}") # add_log 대신 print 사용
+      except Exception as e:
+        # print(f"❌ [{stock_code}] 예상치 못한 오류 발생 (fetch_orderbook): {e}")
+        self.add_log(f"❌ [{stock_code}] 예상치 못한 오류 발생 (fetch_orderbook): {e}") # add_log 대신 print 사용
+      return None
+
     def _split_account_no(self) -> Optional[tuple[str, str]]:
         clean_account_no = self.account_no.replace('-', '') if self.account_no else ""
         account_prefix = ""; account_suffix = ""

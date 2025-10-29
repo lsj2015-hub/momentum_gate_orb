@@ -1,12 +1,8 @@
 # ORB 전략의 핵심인 **시가 돌파 범위(ORB)**와 **거래량가중평균가(VWAP)**를 계산하는 함수를 먼저 구현합니다.
 
-# data/indicators.py
-
 import pandas as pd
-# import pandas_ta as ta # pandas_ta import 제거
 from typing import Dict, Optional
 
-# calculate_orb 함수 (기존 코드 유지)
 def calculate_orb(df: pd.DataFrame, timeframe: int = 15) -> pd.Series:
   """
   개장 후 특정 시간(timeframe) 동안의 고가(ORH)와 저가(ORL)를 계산합니다.
@@ -84,25 +80,73 @@ def add_ema(df: pd.DataFrame, short_period: int = 9, long_period: int = 20):
 # --- 👆 EMA 계산 함수 수정 끝 ---
 
 # --- RVOL 계산 함수 (구조만 정의) ---
-def calculate_rvol(current_volume: float, historical_avg_volume: Optional[float]) -> Optional[float]:
+def calculate_rvol(df: pd.DataFrame, window: int = 20) -> Optional[float]:
     """
-    상대거래량 (Relative Volume, RVOL)을 계산합니다.
-    (주의: historical_avg_volume 데이터 준비 로직은 별도 구현 필요)
+    현재 거래량 대비 이동평균 거래량 비율(RVOL)을 계산합니다.
+    DataFrame을 직접 받아 이동평균을 계산합니다.
+
+    Args:
+      df: 시계열 데이터프레임 ('volume' 컬럼 포함)
+      window: 이동평균 계산 기간 (기본값: 20)
+
+    Returns:
+      계산된 RVOL 값 (float) 또는 계산 불가 시 None
     """
-    if historical_avg_volume is not None and historical_avg_volume > 0:
-        rvol = (current_volume / historical_avg_volume) * 100
+    # 필요한 'volume' 컬럼 존재 여부 및 데이터 길이 확인 (window + 현재 봉 1개)
+    if 'volume' not in df.columns or len(df) < window + 1:
+        print(f"⚠️ RVOL({window}) 계산을 위한 데이터가 부족합니다 (필요: {window + 1}개, 현재: {len(df)}개).")
+        return None
+
+    try:
+        # 최근 window 기간 동안의 거래량 이동평균 계산 (현재 봉 제외)
+        # .iloc[-(window + 1):-1] : 뒤에서부터 (window + 1)번째 데이터부터 마지막 데이터 직전까지 선택
+        avg_volume = df['volume'].iloc[-(window + 1):-1].mean()
+        # 현재 봉(가장 마지막 데이터)의 거래량
+        current_volume = df['volume'].iloc[-1]
+
+        # 이동평균 거래량이 0이면 계산 불가 (0으로 나누기 방지)
+        if avg_volume is None or pd.isna(avg_volume) or avg_volume <= 0:
+            print(f"⚠️ 이동평균 거래량({avg_volume})이 유효하지 않아 RVOL({window}) 계산 불가.")
+            return None
+
+        # RVOL 계산: (현재 거래량 / 평균 거래량) * 100
+        rvol = (current_volume / avg_volume) * 100
+        print(f"✅ RVOL({window}) 계산 완료: {rvol:.2f}% (현재:{current_volume:.0f} / 평균:{avg_volume:.0f})")
         return rvol
-    else:
+    except Exception as e: # 계산 중 예외 발생 시
+        print(f"❌ RVOL({window}) 계산 중 오류 발생: {e}")
         return None
 
 # --- OBI 계산 함수 (구조만 정의) ---
 def calculate_obi(total_bid_volume: Optional[int], total_ask_volume: Optional[int]) -> Optional[float]:
     """
     호가 잔량 비율 (Order Book Imbalance, OBI)을 계산합니다.
-    (주의: 실시간 호가 데이터 필요)
+    OBI = (총 매수 잔량 / 총 매도 잔량) * 100
+
+    Args:
+      total_bid_volume: 총 매수 호가 잔량 (정수)
+      total_ask_volume: 총 매도 호가 잔량 (정수)
+
+    Returns:
+      계산된 OBI 값 (float) 또는 계산 불가 시 None
     """
-    if total_bid_volume is not None and total_ask_volume is not None and total_ask_volume > 0:
+    # 입력값이 유효하지 않으면 None 반환
+    if total_bid_volume is None or total_ask_volume is None:
+        print("⚠️ OBI 계산 입력값 누락 (총매수 또는 총매도 잔량).")
+        return None
+
+    # 총 매도 잔량이 0 이하이면 계산 불가 (0으로 나누기 방지)
+    if total_ask_volume <= 0:
+        print("⚠️ 총 매도 잔량이 0 이하이므로 OBI 계산 불가.")
+        # 이 경우, 매우 큰 값(무한대) 대신 특정 상한값(예: 10000%)을 반환하거나 None을 반환할 수 있습니다.
+        # 여기서는 None을 반환합니다. 필요시 상한값으로 변경 가능합니다.
+        return None
+
+    try:
+        # OBI 계산: (총 매수 잔량 / 총 매도 잔량) * 100
         obi = (total_bid_volume / total_ask_volume) * 100
+        print(f"✅ OBI 계산 완료: {obi:.2f}% (매수잔량:{total_bid_volume}/매도잔량:{total_ask_volume})")
         return obi
-    else:
+    except Exception as e: # 기타 예상치 못한 오류 처리
+        print(f"❌ OBI 계산 중 오류 발생: {e}")
         return None
