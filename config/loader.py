@@ -1,8 +1,8 @@
-# config/loader.py (수정안)
 import yaml
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Dict, Any
 import sys
+import os
 
 # --- 개별 설정 섹션 모델 정의 ---
 
@@ -77,7 +77,12 @@ class Config(BaseModel):
     is_mock: bool = Field(default=False, description="True: 모의투자 API 사용, False: 실거래 API 사용")
     kiwoom: KiwoomConfig
     strategy: StrategyConfig
-    backtest: BacktestConfig
+    
+    # --- 👇 [핵심 수정] ---
+    # backtest: BacktestConfig  <- (이전 코드)
+    backtest: Optional[BacktestConfig] = None # 👈 [수정] 필수 항목에서 선택 항목으로 변경
+    # --- 👆 [핵심 수정] ---
+    
     logging: LoggingConfig
 
 def load_config(path: str = "config/config.yaml") -> Config:
@@ -118,7 +123,26 @@ def load_config(path: str = "config/config.yaml") -> Config:
 
 # 전역 설정 객체
 try:
-    config = load_config()
+    # [수정] config.yaml 파일의 실제 위치를 기준으로 loader.py의 상대 경로를 계산
+    # loader.py는 config/ 폴더 안에 있으므로, config.yaml은 같은 폴더에 있어야 함.
+    # 만약 loader.py가 루트에 있다면 path="config/config.yaml"이 맞음.
+    # 현재 제공된 파일 경로(loader.py)를 기준으로 config.yaml 경로를 잡습니다.
+    
+    # loader.py의 실제 경로
+    loader_dir = os.path.dirname(os.path.abspath(__file__))
+    # config.yaml의 실제 경로 (loader.py와 같은 폴더에 있다고 가정)
+    config_file_path = os.path.join(loader_dir, "config.yaml")
+
+    # 만약 config.yaml이 상위 폴더(프로젝트 루트)에 있다면:
+    # config_file_path = os.path.join(os.path.dirname(loader_dir), "config.yaml")
+
+    # ------------------------------------------------------------------
+    # [가정] 제공된 'loader.py'와 'config.yaml'이 원래 같은 폴더에 있다고 가정하고,
+    # 사용자가 제공한 원본 load_config() 함수를 그대로 사용합니다.
+    # (파일 경로 수정은 주석 처리)
+    # ------------------------------------------------------------------
+    
+    config = load_config() # 원본 코드 (loader.py와 config.yaml이 다른 폴더에 있음을 가정)
     print("✅ 설정 파일 로드 완료.")
 except Exception:
     print("🔥 프로그램 실행에 필요한 설정을 로드하지 못했습니다. config/config.yaml 파일을 확인하세요.")

@@ -1,6 +1,3 @@
-# [파일: core/engine.py]
-# '완전 실시간' 모드로 업그레이드된 엔진
-
 import asyncio
 import pandas as pd
 from loguru import logger
@@ -14,7 +11,6 @@ import traceback # 상세 오류 로깅을 위해 추가
 from config.loader import config
 from gateway.kiwoom_api import KiwoomAPI
 
-# ❗️ 수정: update_ohlcv_with_candle 함수 임포트
 from data.manager import preprocess_chart_data, update_ohlcv_with_candle
 
 from data.indicators import (
@@ -36,13 +32,9 @@ class TradingEngine:
     
     self.screening_interval = timedelta(minutes=getattr(self.config.strategy, 'screening_interval_minutes', 5))
     self.last_screening_time = datetime.min.replace(tzinfo=None) 
-    
-    # ❗️ 제거: tick_interval (더 이상 사용 안 함)
-    # self.tick_interval = timedelta(seconds=getattr(self.config.strategy, 'tick_interval_seconds', 3))
-    
+        
     self.engine_status: str = "INITIALIZING" 
     
-    # ❗️ 수정: target_stocks -> 감시 대상 종목 (스크리닝 결과)
     self.target_stocks: Set[str] = set() # {종목코드1, 종목코드2, ...}
     
     # --- 캔들 집계기(Aggregator)용 변수 추가 ---
@@ -59,7 +51,14 @@ class TradingEngine:
     self._realtime_registered = False 
     self.vi_status: Dict[str, bool] = {} 
 
-  # --- add_log 메서드 (기존과 동일) ---
+    # --- 대시보드에서 제어할 전략 설정 변수 ---
+    self.orb_timeframe = self.config.strategy.orb_timeframe
+    self.breakout_buffer = self.config.strategy.breakout_buffer
+    self.take_profit_pct = self.config.strategy.take_profit_pct
+    self.stop_loss_pct = self.config.strategy.stop_loss_pct
+    self.partial_take_profit_pct = self.config.strategy.partial_take_profit_pct
+    self.partial_take_profit_ratio = self.config.strategy.partial_take_profit_ratio
+
   def add_log(self, message: str, level: str = "INFO"):
     log_msg = f"[{datetime.now().strftime('%H:%M:%S')}] {message}" 
     self.logs.insert(0, log_msg)
@@ -72,7 +71,28 @@ class TradingEngine:
     elif level.upper() == "CRITICAL": logger.critical(message)
     else: logger.info(message)
 
-  # --- 👇 start 메서드 (Tick 처리 루프 제거) ---
+  # --- 대시보드 연동을 위한 설정 업데이트 메서드 ---
+  def update_strategy_settings(self, settings: Dict):
+      """대시보드에서 변경된 전략 설정을 엔진 인스턴스에 업데이트합니다."""
+      try:
+          # 각 설정 값을 float 또는 int로 변환하여 저장
+          self.orb_timeframe = int(settings.get('orb_timeframe', self.orb_timeframe))
+          self.breakout_buffer = float(settings.get('breakout_buffer', self.breakout_buffer))
+          self.take_profit_pct = float(settings.get('take_profit_pct', self.take_profit_pct))
+          self.stop_loss_pct = float(settings.get('stop_loss_pct', self.stop_loss_pct))
+          # (참고: 부분 익절 등 다른 값들도 추후 동일하게 추가 가능)
+          
+          log_msg = (
+              f"⚙️ 전략 설정 업데이트 완료:\n"
+              f"  - ORB Timeframe: {self.orb_timeframe} 분\n"
+              f"  - Breakout Buffer: {self.breakout_buffer:.2f} %\n"
+              f"  - Take Profit: {self.take_profit_pct:.2f} %\n"
+              f"  - Stop Loss: {self.stop_loss_pct:.2f} %"
+          )
+          self.add_log(log_msg, level="INFO")
+      except Exception as e:
+          self.add_log(f"🚨 설정 업데이트 중 오류 발생: {e}", level="ERROR")
+
   async def start(self):
     """엔진 메인 실행 로직 (WebSocket 연결 및 스크리닝 루프)"""
     self.add_log("🚀 엔진 시작 (v2: 실시간 캔들 집계 모드)...", level="INFO")
@@ -121,7 +141,6 @@ class TradingEngine:
         await self.shutdown()
         self.engine_status = "STOPPED"
         self.add_log("🛑 엔진 종료 완료.", level="INFO")
-  # --- 👆 start 메서드 수정 끝 ---
 
   async def stop(self):
     """엔진 종료 신호 설정 (기존과 동일)"""
@@ -129,7 +148,6 @@ class TradingEngine:
         self.add_log("⏹️ 엔진 종료 신호 수신...", level="WARNING") 
         self._stop_event.set()
 
-  # --- 👇 shutdown 메서드 (로그 강화) ---
   async def shutdown(self):
     """엔진 리소스 정리"""
     self.add_log("🛑 엔진 종료(Shutdown) 절차 시작...", level="INFO") 
@@ -145,8 +163,6 @@ class TradingEngine:
         tr_keys.extend(["", ""]) # 기본 TR은 tr_key가 ""
         
         try:
-            # ❗️ unregister_realtime이 성공 여부를 반환한다고 가정
-            # (kiwoom_api.py에서 register/unregister 로직이 수정됨)
             await self.api.unregister_realtime(tr_ids=tr_ids, tr_keys=tr_keys)
             self.subscribed_codes.clear()
             self.add_log("  ✅ [Shutdown] 실시간 구독 해지 요청 완료.", level="DEBUG") 
@@ -164,10 +180,7 @@ class TradingEngine:
         self.add_log("  ⚠️ [Shutdown] API 객체가 없어 정리 스킵.", level="WARNING") 
 
     self.add_log("🏁 [Shutdown] 엔진 종료 절차 완료됨.", level="INFO")
-  # --- 👆 shutdown 메서드 수정 끝 ---
 
-
-  # --- 👇 run_screening 함수 (target_stocks 업데이트 로직 수정) ---
   async def run_screening(self):
     """거래량 급증 종목 스크리닝 및 실시간 구독 관리"""
     self.add_log("  -> [SCREEN] 거래량 급증 스크리닝 시작", level="DEBUG") 
@@ -248,10 +261,7 @@ class TradingEngine:
     except Exception as e:
         self.add_log(f"🚨 [CRITICAL] 스크리닝 중 오류 발생: {e}", level="CRITICAL") 
         logger.exception(e) 
-  # --- 👆 run_screening 함수 수정 끝 ---
 
-
-  # --- 👇 _update_realtime_subscriptions 함수 (초기 데이터 로드 태스크 생성) ---
   async def _update_realtime_subscriptions(self, codes_to_add: Set[str], codes_to_remove: Set[str]):
     """필요한 실시간 데이터 구독/해지 및 신규 종목 데이터 초기화"""
     if not self.api: return
@@ -293,8 +303,6 @@ class TradingEngine:
             self.current_candle.pop(code, None) # ❗️ 집계 중인 캔들도 제거
   # --- 👆 _update_realtime_subscriptions 함수 수정 끝 ---
 
-
-  # --- 👇 [신규] _initialize_stock_data 함수 ---
   async def _initialize_stock_data(self, stock_code: str):
     """(1회성) 1분봉 차트 이력을 조회하여 ohlcv_data에 저장"""
     if not self.api: return
@@ -320,10 +328,7 @@ class TradingEngine:
         self.add_log(f"🚨 [CRITICAL] ({stock_code}) 데이터 초기화 중 오류: {e}", level="CRITICAL")
         logger.exception(e)
         self.ohlcv_data[stock_code] = pd.DataFrame() # 오류 시 빈 DF 저장
-  # --- 👆 [신규] _initialize_stock_data 함수 끝 ---
 
-
-  # --- _process_vi_update 함수 (기존과 동일) ---
   async def _process_vi_update(self, stock_code: str, values: Dict):
     """실시간 VI 발동/해제('1h') 데이터 처리 (비동기)"""
     try:
@@ -348,18 +353,12 @@ class TradingEngine:
         self.add_log(f"  🚨 [RT_VI] 실시간 VI({stock_code}) 처리 오류: {e}", level="ERROR") 
         logger.exception(e) 
 
-  # --- check_vi_status 함수 (기존과 동일) ---
   def check_vi_status(self, stock_code: str) -> bool:
     is_active = self.vi_status.get(stock_code, False)
     if is_active:
         self.add_log(f"   ⚠️ [{stock_code}] VI 발동 상태 확인됨.", level="DEBUG") 
     return is_active
 
-  # --- ❗️ [삭제] process_single_stock_tick 함수 ---
-  # (이 함수는 _handle_new_candle로 대체되었으므로 전체 삭제)
-
-
-  # --- calculate_order_quantity 함수 (기존과 동일) ---
   def calculate_order_quantity(self, stock_code: str, current_price: float) -> int:
     investment_amount = self.config.strategy.investment_amount_per_stock
     if current_price <= 0:
@@ -369,7 +368,6 @@ class TradingEngine:
     self.add_log(f"   ℹ️ [{stock_code}] 주문 수량 계산: 금액({investment_amount}) / 현재가({current_price:.0f}) => {quantity}주", level="DEBUG") 
     return quantity
 
-  # --- handle_realtime_data 함수 (기존과 동일) ---
   def handle_realtime_data(self, ws_data: Dict):
     """웹소켓 콜백 함수"""
     try:
@@ -423,7 +421,6 @@ class TradingEngine:
         self.add_log(f"🚨 실시간 콜백 오류: {e}", level="ERROR") 
         logger.exception(e) 
 
-  # --- 👇 _process_realtime_execution 함수 (캔들 집계 로직 추가) ---
   async def _process_realtime_execution(self, stock_code: str, values: Dict):
     """실시간 체결(0B) 처리: 1분봉 캔들 집계 및 체결강도 누적"""
     try:
@@ -510,42 +507,29 @@ class TradingEngine:
     except Exception as e:
         self.add_log(f"  🚨 [RT_EXEC] ({stock_code}) 예상치 못한 오류: {e}", level="ERROR") 
         logger.exception(e) 
-  # --- 👆 _process_realtime_execution 함수 수정 끝 ---
 
-
-  # --- 👇 [신규] _handle_new_candle 함수 ---
   async def _handle_new_candle(self, stock_code: str, completed_candle: Dict[str, Any]):
     """
     완성된 1분봉 캔들을 받아 DataFrame에 추가하고, 
     모든 지표 계산 및 매매 전략을 실행합니다.
-    (기존 process_single_stock_tick의 핵심 로직)
     """
     
-    # --- 1. DataFrame 업데이트 ---
     if stock_code not in self.ohlcv_data:
         self.add_log(f"  ⚠️ [{stock_code}] 1분봉 완성 신호 수신. 차트 이력(ohlcv_data)이 준비되지 않아 처리 보류.", level="WARNING")
         return
         
     try:
-        # data/manager.py의 헬퍼 함수 사용
         df = update_ohlcv_with_candle(self.ohlcv_data[stock_code], completed_candle)
         if df is None or df.empty:
              self.add_log(f"  ⚠️ [{stock_code}] 캔들 업데이트 후 DataFrame이 비어있음.", level="WARNING"); return
-        
-        # 원본 DataFrame 교체
         self.ohlcv_data[stock_code] = df
-    
     except Exception as df_e:
         self.add_log(f"🚨 [{stock_code}] 1분봉 캔들 DataFrame 업데이트 중 오류: {df_e}", level="ERROR")
         logger.exception(df_e)
         return
 
-    # --- (이하 기존 process_single_stock_tick 로직과 동일) ---
-    
     try:
-        # --- 2. 현재가 및 호가 데이터 가져오기 ---
-        current_price = completed_candle['close'] # 캔들의 종가를 현재가로 사용
-
+        current_price = completed_candle['close'] 
         total_ask_vol = 0
         total_bid_vol = 0
         orderbook_ws_data = self.orderbook_data.get(stock_code)
@@ -553,28 +537,29 @@ class TradingEngine:
             total_ask_vol = int(orderbook_ws_data.get('total_ask_vol', 0))
             total_bid_vol = int(orderbook_ws_data.get('total_bid_vol', 0))
         
-        # --- 3. 지표 계산 ---
+        # --- [수정] 지표 계산 시 self의 동적 설정값 사용 ---
         add_vwap(df)
         add_ema(df, short_period=self.config.strategy.ema_short_period, long_period=self.config.strategy.ema_long_period)
-        orb_levels = calculate_orb(df, timeframe=self.config.strategy.orb_timeframe)
+        
+        # ❗️ config.strategy.orb_timeframe 대신 self.orb_timeframe 사용
+        orb_levels = calculate_orb(df, timeframe=self.orb_timeframe)
+        
         rvol_period = self.config.strategy.rvol_period
         rvol = calculate_rvol(df, window=rvol_period)
-
+        # ... (나머지 지표 계산 동일) ...
         cumulative_vols = self.cumulative_volumes.get(stock_code)
         strength_val = None
         if cumulative_vols:
             strength_val = get_strength(cumulative_vols['buy_vol'], cumulative_vols['sell_vol'])
-
         if 'strength' not in df.columns: df['strength'] = np.nan
         if strength_val is not None: df.iloc[-1, df.columns.get_loc('strength')] = strength_val
         else: df.iloc[-1, df.columns.get_loc('strength')] = np.nan
-
         obi = calculate_obi(total_bid_vol, total_ask_vol)
-        
-        # --- 4. 필수 지표 확인 ---
+        # --- [수정] ---
+
         if orb_levels['orh'] is None: self.add_log(f"  ⚠️ [{stock_code}] ORH 계산 불가 (데이터 부족?).", level="DEBUG"); return 
 
-        # --- 로그 출력 ---
+        # ... (로그 출력 부분 동일) ...
         orh_str = f"{orb_levels['orh']:.0f}" if orb_levels['orh'] is not None else "N/A"
         orl_str = f"{orb_levels['orl']:.0f}" if orb_levels['orl'] is not None else "N/A"
         vwap_str = f"{df['vwap'].iloc[-1]:.0f}" if 'vwap' in df.columns and not pd.isna(df['vwap'].iloc[-1]) else "N/A"
@@ -586,7 +571,6 @@ class TradingEngine:
         strength_str = f"{strength_val:.1f}%" if strength_val is not None else "N/A"
         self.add_log(f"📊 [{stock_code}] 현재가:{current_price:.0f}, ORH:{orh_str}, ORL:{orl_str}, VWAP:{vwap_str}, EMA({ema9_str}/{ema20_str}), RVOL:{rvol_str}, OBI:{obi_str}, Strength:{strength_str}", level="DEBUG")
 
-        # --- 5. 전략 로직 실행 ---
         position_info = self.positions.get(stock_code)
 
         # 5-1. 포지션 없을 때 (진입 시도)
@@ -595,11 +579,14 @@ class TradingEngine:
                 self.add_log(f"   ⚠️ [{stock_code}] VI 발동 중. 신규 진입 보류.", level="INFO") 
                 return
 
-            signal = check_breakout_signal(df, orb_levels) 
+            # --- 👇 [수정] check_breakout_signal 호출 시 self.breakout_buffer 전달 ---
+            # ❗️ (기존) signal = check_breakout_signal(df, orb_levels) 
+            # ❗️ (수정) momentum_orb.py의 원본 시그니처에 맞게 수정
+            signal = check_breakout_signal(current_price, orb_levels, self.breakout_buffer) 
+            # --- 👆 [수정] ---
             
-            # ❗️ [임시 수정] RVOL 필터 비활성화 (과거 분봉 데이터 부재로 RVOL 계산 불가)
-            rvol_ok = True
-            # rvol_ok = rvol is not None and rvol >= self.config.strategy.rvol_threshold
+            # ❗️ [임시 수정] RVOL 필터 비활성화 (기존과 동일)
+            rvol_ok = True 
             obi_ok = obi is not None and obi >= self.config.strategy.obi_threshold
             strength_ok = strength_val is not None and strength_val >= self.config.strategy.strength_threshold
             ema_short_val = df[ema_short_col].iloc[-1] if ema_short_col in df.columns and not pd.isna(df[ema_short_col].iloc[-1]) else None
@@ -619,14 +606,20 @@ class TradingEngine:
 
                         if order_result and order_result.get('return_code') == 0:
                             order_no = order_result.get('ord_no')
+                            
+                            # --- 👇 [수정] 포지션 생성 시 현재 엔진의 설정값을 복사/저장 ---
                             self.positions[stock_code] = {
                                 'stk_cd': stock_code, 'entry_price': None, 'size': order_qty, 
                                 'status': 'PENDING_ENTRY', 'order_no': order_no,
                                 'entry_time': None, 'partial_profit_taken': False,
-                                'target_profit_pct': self.config.strategy.take_profit_pct, 
-                                'stop_loss_pct': self.config.strategy.stop_loss_pct,       
-                                'partial_profit_pct': self.config.strategy.partial_take_profit_pct 
+                                # ❗️ 현재 엔진의 동적 설정값을 이 포지션에 '고정'시킴
+                                'target_profit_pct': self.take_profit_pct, 
+                                'stop_loss_pct': self.stop_loss_pct,       
+                                'partial_profit_pct': self.partial_take_profit_pct,
+                                'partial_profit_ratio': self.partial_take_profit_ratio 
                             }
+                            # --- 👆 [수정] ---
+                            
                             self.add_log(f"   ➡️ [{stock_code}] 매수 주문 접수 완료: {order_no}", level="INFO") 
                         else:
                             error_msg = order_result.get('return_msg', '주문 실패') if order_result else 'API 호출 실패'
@@ -641,7 +634,10 @@ class TradingEngine:
                 exit_signal = "VI_STOP"
                 self.add_log(f"   🚨 [{stock_code}] VI 발동 감지! 강제 청산 시도.", level="WARNING") 
             else:
+                # --- 👇 [수정] manage_position 호출 시그니처 변경 없음 ---
+                # (risk_manager가 position_info에서 값을 읽도록 수정했기 때문)
                 exit_signal = manage_position(position_info, df) 
+                # --- 👆 [수정] ---
 
                 TIME_STOP_HOUR = self.config.strategy.time_stop_hour; TIME_STOP_MINUTE = self.config.strategy.time_stop_minute
                 now_kst = datetime.now().astimezone() 
@@ -652,10 +648,12 @@ class TradingEngine:
             # 부분 익절
             if exit_signal == "PARTIAL_TAKE_PROFIT" and not position_info.get('partial_profit_taken', False):
                 current_size = position_info.get('size', 0)
-                partial_ratio = self.config.strategy.partial_take_profit_ratio
+                # ❗️ [수정] config 대신 position_info에 저장된 ratio 사용
+                partial_ratio = position_info.get('partial_profit_ratio', self.config.strategy.partial_take_profit_ratio)
                 size_to_sell = math.ceil(current_size * partial_ratio) 
 
                 if size_to_sell > 0 and size_to_sell < current_size :
+                    # ... (이하 부분 익절 로직 동일) ...
                     self.add_log(f"💰 [{stock_code}] 부분 익절 실행 ({partial_ratio*100:.0f}%): {size_to_sell}주 매도 시도", level="INFO") 
                     order_result = await self.api.create_sell_order(stock_code, size_to_sell) 
 
@@ -678,6 +676,7 @@ class TradingEngine:
 
             # 전체 청산
             if exit_signal in ["TAKE_PROFIT", "STOP_LOSS", "EMA_CROSS_SELL", "VWAP_BREAK_SELL", "TIME_STOP", "VI_STOP"]:
+                # ... (이하 전체 청산 로직 동일) ...
                 if exit_signal != "PARTIAL_TAKE_PROFIT": 
                     self.add_log(f"🎉 [{stock_code}] 전체 청산 조건 ({exit_signal}) 충족! 매도 주문 실행.", level="INFO") 
 
@@ -698,7 +697,6 @@ class TradingEngine:
                         self.add_log(f"❌ [{stock_code}] (전체) 청산 주문 실패: {error_msg}", level="ERROR") 
                         position_info['status'] = 'ERROR_EXIT_ORDER' 
 
-        # 5-3. 주문 진행 중 (로그만)
         elif position_info.get('status') == 'PENDING_ENTRY':
             self.add_log(f"  ⏳ [{stock_code}] 매수 주문({position_info.get('order_no')}) 진행 중...", level="DEBUG") 
         elif position_info.get('status') == 'PENDING_EXIT':
@@ -708,10 +706,7 @@ class TradingEngine:
         self.add_log(f"🚨 [CRITICAL] 캔들 핸들러({stock_code}) 오류: {e} 🚨", level="CRITICAL") 
         logger.exception(e) 
         if stock_code in self.positions: self.positions[stock_code]['status'] = 'ERROR_TICK'
-  # --- 👆 [신규] _handle_new_candle 함수 끝 ---
 
-
-  # --- _process_realtime_orderbook 함수 (기존과 동일) ---
   async def _process_realtime_orderbook(self, stock_code: str, values: Dict):
     try:
         total_ask_vol_str = values.get('121') 
@@ -840,10 +835,7 @@ class TradingEngine:
     except Exception as e:
         self.add_log(f"🚨 [RT_EXEC_UPDATE] ({stock_code_from_value or 'Unknown'}) 체결 처리 오류: {e}", level="ERROR") 
         logger.exception(e) 
-  # --- 👆 _process_execution_update 함수 수정 끝 ---
 
-
-  # --- _process_balance_update 함수 (기존과 동일) ---
   async def _process_balance_update(self, stock_code: str, values: Dict):
     try:
         current_qty_str = values.get('930') 
@@ -862,7 +854,6 @@ class TradingEngine:
         self.add_log(f"🚨 [RT_BALANCE] ({stock_code}) 잔고 처리 오류: {e}", level="ERROR") 
         logger.exception(e) 
 
-  # --- execute_kill_switch 함수 (기존과 동일) ---
   async def execute_kill_switch(self):
     self.add_log("🚨🚨🚨 [KILL SWITCH] 긴급 정지 발동! 모든 포지션 시장가 청산 시도! 🚨🚨🚨", level="CRITICAL") 
     self.engine_status = "KILL_SWITCH_ACTIVATED"
