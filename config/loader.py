@@ -1,126 +1,125 @@
-# config/loader.py
+# config/loader.py (수정안)
 import yaml
 from pydantic import BaseModel, Field
 from typing import Optional
+import sys
 
 # --- 개별 설정 섹션 모델 정의 ---
 
 class KiwoomConfig(BaseModel):
     # 실거래 정보
-    app_key: str
-    app_secret: str
-    account_no: str
-    # 모의투자 정보
-    mock_app_key: str
-    mock_app_secret: str
-    mock_account_no: str
+    app_key: str = Field(..., description="실거래 API 앱 키")
+    app_secret: str = Field(..., description="실거래 API 앱 시크릿")
+    account_no: str = Field(..., description="실거래 계좌번호 (하이픈 제외 8자리 또는 10자리)")
 
-class EngineConfig(BaseModel):
-    screening_interval_minutes: int = 5 # 기본값 5분
+    # 모의투자 정보 (Optional)
+    mock_app_key: Optional[str] = Field(None, description="모의투자 API 앱 키")
+    mock_app_secret: Optional[str] = Field(None, description="모의투자 API 앱 시크릿")
+    mock_account_no: Optional[str] = Field(None, description="모의투자 계좌번호 (하이픈 제외 8자리 또는 10자리)")
 
 class StrategyConfig(BaseModel):
-    # --- 파트너님 YAML 기준 기존 파라미터 ---
-    orb_timeframe: int = 15
-    breakout_buffer: float = 0.15
-    investment_amount_per_stock: int # YAML에 값이 있으므로 기본값 불필요
-    take_profit_pct: float = 2.5 # (전체) 익절 기준 (%)
-    stop_loss_pct: float = -1.0 # 손절 기준 (%)
-    partial_take_profit_pct: Optional[float] = 1.5 # 부분 익절 목표 수익률 (%) (None이면 사용 안 함)
-    partial_take_profit_ratio: float = 0.4         # 부분 익절 시 매도 비율 (예: 0.4 = 40%)
-    stop_loss_vwap_pct: Optional[float] = None # YAML에 주석처리 되어 있으므로 Optional 유지
-    max_target_stocks: int = 5
-    max_concurrent_positions: int = 5 # YAML 기준 5로 수정 (기존 loader는 3)
+    # --- ORB 관련 ---
+    orb_timeframe: int = Field(default=15, description="ORB 계산 시간 (분, 예: 9시 N분까지)")
+    breakout_buffer: float = Field(default=0.15, description="ORB 돌파 시 진입 버퍼 (%)")
 
-    # --- 스크리닝 관련 설정 ---
-    screening_interval_minutes: int = 5
-    screening_surge_timeframe_minutes: int = 5
-    screening_min_volume_threshold: int = 10
-    screening_min_price: int = 1000
-    screening_min_surge_rate: float = 100.0
+    # --- 진입 필터 관련 ---
+    ema_short_period: int = Field(default=9, description="단기 EMA 기간")
+    ema_long_period: int = Field(default=20, description="장기 EMA 기간")
+    rvol_period: int = Field(default=20, description="RVOL 계산 시 이동평균 기간 (봉 개수)")
+    rvol_threshold: float = Field(default=150.0, description="상대 거래량(RVOL) 최소 진입 기준 (%)")
+    obi_threshold: float = Field(default=1.5, description="주문 장부 불균형(OBI) 최소 진입 기준 (매수잔량/매도잔량 비율)")
+    strength_threshold: float = Field(default=100.0, description="체결 강도 최소 진입 기준 (%)")
+
+    # --- 청산 조건 관련 ---
+    take_profit_pct: float = Field(default=2.5, description="고정 익절 기준 (%)")
+    stop_loss_pct: float = Field(default=-1.0, description="고정 손절 기준 (%)")
+    partial_take_profit_pct: Optional[float] = Field(default=1.5, description="부분 익절 목표 수익률 (%). None이면 사용 안 함")
+    partial_take_profit_ratio: float = Field(default=0.4, description="부분 익절 시 매도 비율 (예: 0.4 = 40%)")
+    time_stop_hour: int = Field(default=14, description="시간 청산 기준 (시)")
+    time_stop_minute: int = Field(default=50, description="시간 청산 기준 (분)")
+
+    # --- 자금/포지션 관리 ---
+    investment_amount_per_stock: int = Field(..., description="종목당 고정 투자 금액 (원)") # 기본값 없이 필수 입력
+    max_concurrent_positions: int = Field(default=5, description="동시에 보유할 최대 종목 수")
+
+    # --- 스크리닝 관련 상세 설정 ---
+    max_target_stocks: int = Field(default=5, description="스크리닝 후 최대 관심 종목 수")
+    screening_interval_minutes: int = Field(default=5, description="스크리닝 주기 (분)")
+    screening_surge_timeframe_minutes: int = Field(default=5, description="거래량 급증 비교 시간 (분)")
+    screening_min_volume_threshold: int = Field(default=10, description="최소 거래량 기준 (만주 단위, 예: 10 -> 10,000주)")
+    screening_min_price: int = Field(default=1000, description="최소 가격 기준 (원)")
+    screening_min_surge_rate: float = Field(default=100.0, description="최소 거래량 급증률 기준 (%)")
 
     # --- Tick 처리 간격 설정 ---
-    tick_interval_seconds: int = 5
+    tick_interval_seconds: int = Field(default=5, description="개별 종목 Tick 데이터 처리 주기 (초)")
 
-    # --- 👇 신규 파라미터 추가 (이전 논의 내용 반영) ---
-    rvol_threshold: float = 130.0      # 상대 거래량 임계값 (%) - 기본값 설정
-    obi_threshold: float = 1.5         # OBI 임계값 - 기본값 설정
-    strength_threshold: float = 100.0  # 체결강도 임계값 - 기본값 설정
-    time_stop_hour: int = 14           # 시간 청산 기준 (시) - 기본값 설정
-    time_stop_minute: int = 50         # 시간 청산 기준 (분) - 기본값 설정
-    ema_short_period: int = 9          # 단기 EMA 기간 - 기본값 설정
-    ema_long_period: int = 20          # 장기 EMA 기간 - 기본값 설정
-    rvol_period: int = 20              # RVOL 기간 (필요시) - 기본값 설정
-    # --- 👆 신규 파라미터 추가 끝 ---
+# --- 👇 백테스팅 설정 클래스 ---
+class BacktestConfig(BaseModel):
+    initial_balance: float = Field(..., description="백테스팅 초기 자본금 (원)") # 필수 입력
+    commission_rate: float = Field(default=0.00015, description="매매 수수료율 (예: 0.015% -> 0.00015)")
+    tax_rate: float = Field(default=0.002, description="매도 시 거래세율 (예: 0.2% -> 0.002)")
+    use_fixed_amount: bool = Field(default=True, description="True: strategy.investment_amount_per_stock 사용, False: 아래 investment_ratio 사용")
+    investment_ratio: Optional[float] = Field(default=0.1, description="자산 대비 투자 비율 (use_fixed_amount=False 시 사용, 예: 10% -> 0.1)")
 
+# --- 👇 로깅 설정 클래스 추가 ---
+class LoggingConfig(BaseModel):
+    level: str = Field(default="INFO", description="로그 레벨 (DEBUG, INFO, WARNING, ERROR)")
+    directory: str = Field(default="logs", description="로그 파일 저장 디렉토리")
+    rotation: str = Field(default="10 MB", description="로그 파일 순환 크기")
+    retention: str = Field(default="7 days", description="로그 파일 보관 기간")
+    format: str = Field(
+        default="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {name}:{function}:{line} - {message}",
+        description="로그 포맷"
+    )
 
-# --- 전체 설정을 통합하는 메인 모델 ---
+# --- 메인 설정 클래스 ---
 class Config(BaseModel):
-    is_mock: bool = True
+    is_mock: bool = Field(default=False, description="True: 모의투자 API 사용, False: 실거래 API 사용")
     kiwoom: KiwoomConfig
-    engine: EngineConfig = Field(default_factory=EngineConfig)
     strategy: StrategyConfig
+    backtest: BacktestConfig
+    logging: LoggingConfig
 
 def load_config(path: str = "config/config.yaml") -> Config:
     """YAML 설정 파일을 로드하고 Pydantic 모델로 파싱합니다."""
     try:
         with open(path, 'r', encoding='utf-8') as f:
             config_data = yaml.safe_load(f)
-        if not config_data:
-             raise ValueError("설정 파일이 비어있습니다.")
+            if not config_data:
+                raise ValueError(f"설정 파일({path})이 비어 있거나 유효한 YAML 형식이 아닙니다.")
+            
+        # 'engine' 섹션 마이그레이션 (이전 config.yaml 호환용)
+        if 'engine' in config_data:
+            if 'strategy' not in config_data:
+                config_data['strategy'] = {}
+            if 'screening_interval_minutes' in config_data['engine']:
+                config_data['strategy']['screening_interval_minutes'] = config_data['engine']['screening_interval_minutes']
+            del config_data['engine']
+            print("ℹ️ [Config] 'engine' 섹션을 'strategy'로 자동 병합했습니다.")
 
-        parsed_config = Config(**config_data)
-
-        # --- 디버깅 코드 ---
-        print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        print(f"!!! DEBUG LOADER: 로드된 investment_amount_per_stock = {parsed_config.strategy.investment_amount_per_stock}")
-        print(f"!!! DEBUG LOADER: 로드된 rvol_threshold = {parsed_config.strategy.rvol_threshold}") # 새로 추가된 값 예시 확인
-        print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        # --- 디버깅 코드 끝 ---
-
-        return parsed_config
-
+        return Config(**config_data)
+    
     except FileNotFoundError:
-        print(f"🚨 설정 파일({path})을 찾을 수 없습니다. 기본값으로 진행합니다.")
-        dummy_kiwoom = KiwoomConfig(
-            app_key="dummy_real_key", app_secret="dummy_real_secret", account_no="dummy_real_acct",
-            mock_app_key="dummy_mock_key", mock_app_secret="dummy_mock_secret", mock_account_no="dummy_mock_acct"
-        )
-        # --- 👇 기본 StrategyConfig 생성 시 모든 필드에 기본값 할당 (필수 필드 포함) ---
-        default_strategy = StrategyConfig(
-            # --- 필수 필드 ---
-            investment_amount_per_stock=100000, # 예시 기본값
-            partial_take_profit_pct=1.5, # 예시 기본값
-            partial_take_profit_ratio=0.4, # 예시 기본값
-            # --- Optional 제외 모든 필드에 기본값 할당 (모델 정의에 기본값 있으면 생략 가능) ---
-            orb_timeframe=15,
-            breakout_buffer=0.15,
-            take_profit_pct=2.5,
-            stop_loss_pct=-1.0,
-            max_target_stocks=5,
-            max_concurrent_positions=5, # YAML 기준 5
-            screening_interval_minutes=5,
-            screening_surge_timeframe_minutes=5,
-            screening_min_volume_threshold=10,
-            screening_min_price=1000,
-            screening_min_surge_rate=100.0,
-            tick_interval_seconds=5,
-            rvol_threshold=130.0,
-            obi_threshold=1.5,
-            strength_threshold=100.0,
-            time_stop_hour=14,
-            time_stop_minute=50,
-            ema_short_period=9,
-            ema_long_period=20,
-            rvol_period=20
-        )
-        # --- 👆 수정 끝 ---
-        return Config(kiwoom=dummy_kiwoom, strategy=default_strategy, is_mock=True)
-    except yaml.YAMLError as e:
-        print(f"🚨 설정 파일({path}) 파싱 오류: {e}")
+        print(f"❌ 설정 파일({path})을 찾을 수 없습니다.")
         raise
-    except Exception as e:
-        print(f"🚨 설정 로드 중 예상치 못한 오류: {e}")
+    except yaml.YAMLError as e:
+        print(f"❌ 설정 파일({path}) 파싱 오류: {e}")
+        raise
+    except ValueError as e: # 빈 파일 또는 잘못된 형식 오류 처리
+        print(f"❌ 설정 파일({path}) 내용 오류: {e}")
+        raise
+    except Exception as e: # Pydantic 유효성 검사 오류 포함
+        print(f"❌ 설정 로드 중 오류 발생: {e}")
+        # Pydantic 유효성 검사 오류 시 상세 정보 출력
+        if hasattr(e, 'errors'):
+             for error in e.errors():
+                 print(f"  - 필드: {'.'.join(map(str, error['loc']))}, 오류: {error['msg']}")
         raise
 
-# --- 전역 설정 객체 ---
-config: Config = load_config()
+# 전역 설정 객체
+try:
+    config = load_config()
+    print("✅ 설정 파일 로드 완료.")
+except Exception:
+    print("🔥 프로그램 실행에 필요한 설정을 로드하지 못했습니다. config/config.yaml 파일을 확인하세요.")
+    raise SystemExit("설정 로드 실패로 프로그램을 종료합니다.")
