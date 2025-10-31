@@ -30,7 +30,8 @@ class TradingEngine:
     self.api: Optional[KiwoomAPI] = None 
     self._stop_event = asyncio.Event() 
     
-    self.screening_interval = timedelta(minutes=getattr(self.config.strategy, 'screening_interval_minutes', 5))
+    self.screening_interval_minutes = self.config.strategy.screening_interval_minutes
+    self.screening_interval = timedelta(minutes=self.screening_interval_minutes)
     self.last_screening_time = datetime.min.replace(tzinfo=None) 
         
     self.engine_status: str = "INITIALIZING" 
@@ -51,13 +52,25 @@ class TradingEngine:
     self._realtime_registered = False 
     self.vi_status: Dict[str, bool] = {} 
 
-    # --- 대시보드에서 제어할 전략 설정 변수 ---
+    # --- 대시보드 제어용 전략 변수 ---
+    # (진입/청산)
     self.orb_timeframe = self.config.strategy.orb_timeframe
     self.breakout_buffer = self.config.strategy.breakout_buffer
     self.take_profit_pct = self.config.strategy.take_profit_pct
     self.stop_loss_pct = self.config.strategy.stop_loss_pct
     self.partial_take_profit_pct = self.config.strategy.partial_take_profit_pct
     self.partial_take_profit_ratio = self.config.strategy.partial_take_profit_ratio
+    
+    # (자금/포지션)
+    self.investment_amount_per_stock = self.config.strategy.investment_amount_per_stock
+    self.max_concurrent_positions = self.config.strategy.max_concurrent_positions
+    
+    # (스크리닝)
+    self.max_target_stocks = self.config.strategy.max_target_stocks
+    self.screening_surge_timeframe_minutes = self.config.strategy.screening_surge_timeframe_minutes
+    self.screening_min_volume_threshold = self.config.strategy.screening_min_volume_threshold
+    self.screening_min_price = self.config.strategy.screening_min_price
+    self.screening_min_surge_rate = self.config.strategy.screening_min_surge_rate
 
   def add_log(self, message: str, level: str = "INFO"):
     log_msg = f"[{datetime.now().strftime('%H:%M:%S')}] {message}" 
@@ -75,28 +88,68 @@ class TradingEngine:
   def update_strategy_settings(self, settings: Dict):
       """대시보드에서 변경된 전략 설정을 엔진 인스턴스에 업데이트합니다."""
       try:
-          # 각 설정 값을 float 또는 int로 변환하여 저장
+          # (진입/청산)
           self.orb_timeframe = int(settings.get('orb_timeframe', self.orb_timeframe))
           self.breakout_buffer = float(settings.get('breakout_buffer', self.breakout_buffer))
           self.take_profit_pct = float(settings.get('take_profit_pct', self.take_profit_pct))
           self.stop_loss_pct = float(settings.get('stop_loss_pct', self.stop_loss_pct))
-          # (참고: 부분 익절 등 다른 값들도 추후 동일하게 추가 가능)
           
+          # (자금/포지션)
+          self.investment_amount_per_stock = int(settings.get('investment_amount_per_stock', self.investment_amount_per_stock))
+          self.max_concurrent_positions = int(settings.get('max_concurrent_positions', self.max_concurrent_positions))
+          
+          # (스크리닝)
+          self.max_target_stocks = int(settings.get('max_target_stocks', self.max_target_stocks))
+          
+          # ❗️ 스크리닝 주기는 timedelta 객체도 함께 업데이트
+          new_interval_min = int(settings.get('screening_interval_minutes', self.screening_interval_minutes))
+          if self.screening_interval_minutes != new_interval_min:
+              self.screening_interval_minutes = new_interval_min
+              self.screening_interval = timedelta(minutes=new_interval_min) # 👈 timedelta 업데이트
+              self.add_log(f"  -> [SETTINGS] 스크리닝 주기 변경됨: {new_interval_min}분", level="DEBUG")
+              
+          self.screening_surge_timeframe_minutes = int(settings.get('screening_surge_timeframe_minutes', self.screening_surge_timeframe_minutes))
+          self.screening_min_volume_threshold = int(settings.get('screening_min_volume_threshold', self.screening_min_volume_threshold))
+          self.screening_min_price = int(settings.get('screening_min_price', self.screening_min_price))
+          self.screening_min_surge_rate = float(settings.get('screening_min_surge_rate', self.screening_min_surge_rate))
+          
+          # 로그 메시지 상세화
           log_msg = (
               f"⚙️ 전략 설정 업데이트 완료:\n"
-              f"  - ORB Timeframe: {self.orb_timeframe} 분\n"
-              f"  - Breakout Buffer: {self.breakout_buffer:.2f} %\n"
-              f"  - Take Profit: {self.take_profit_pct:.2f} %\n"
-              f"  - Stop Loss: {self.stop_loss_pct:.2f} %"
+              f"  [진입/청산]\n"
+              f"  - ORB Timeframe: {self.orb_timeframe} 분, Buffer: {self.breakout_buffer:.2f} %\n"
+              f"  - Take Profit: {self.take_profit_pct:.2f} %, Stop Loss: {self.stop_loss_pct:.2f} %\n"
+              f"  [자금/스크리닝]\n"
+              f"  - 종목당 투자금: {self.investment_amount_per_stock} 원, 최대 보유: {self.max_concurrent_positions} 종목\n"
+              f"  - 스크리닝 주기: {self.screening_interval_minutes} 분, 최대 후보: {self.max_target_stocks} 개\n"
+              f"  - (조건) 급증시간: {self.screening_surge_timeframe_minutes}분, 최소거래(만): {self.screening_min_volume_threshold}, 최소가격: {self.screening_min_price}, 최소급증률: {self.screening_min_surge_rate}%"
           )
           self.add_log(log_msg, level="INFO")
+          
       except Exception as e:
           self.add_log(f"🚨 설정 업데이트 중 오류 발생: {e}", level="ERROR")
 
   async def start(self):
     """엔진 메인 실행 로직 (WebSocket 연결 및 스크리닝 루프)"""
+    # 1. 엔진 재시작 시 _stop_event를 명확하게 리셋(초기화)합니다.
+    if self._stop_event.is_set():
+        self.add_log("  -> [START] 기존 종료 신호(_stop_event)를 리셋합니다.", level="DEBUG")
+        self._stop_event.clear()
+    
     self.add_log("🚀 엔진 시작 (v2: 실시간 캔들 집계 모드)...", level="INFO")
     self.engine_status = "STARTING"
+
+    # 2. 이전 API 객체가 있다면 안전하게 종료하고, 항상 새 객체를 생성합니다.
+    # (HTTP 클라이언트와 웹소켓 상태를 완전히 초기화하기 위함)
+    if self.api:
+        self.add_log("  -> [START] 기존 API 객체 정리 시도...", level="WARNING")
+        try:
+            await self.api.close() # HTTP 세션 닫기
+            await self.api.disconnect_websocket() # WS 닫기 (방어적)
+            self.add_log("  -> [START] 기존 API 객체 정리 완료.", level="DEBUG")
+        except Exception as e:
+            self.add_log(f"  -> [START] 기존 API 객체 정리 중 오류: {e}", level="WARNING")
+    
     self.api = KiwoomAPI() 
 
     ws_connected = False
@@ -125,9 +178,6 @@ class TradingEngine:
                 self.last_screening_time = now.replace(tzinfo=None) 
                 self.add_log("   스크리닝 완료.", level="DEBUG")
 
-            # ❗️ 제거: 대상 종목 Tick 처리 (process_single_stock_tick) 루프
-            # 이 로직은 _handle_new_candle로 이전됨
-
             await asyncio.sleep(5) # 스크리닝 루프 지연 (CPU 사용량 조절)
 
     except asyncio.CancelledError:
@@ -143,7 +193,7 @@ class TradingEngine:
         self.add_log("🛑 엔진 종료 완료.", level="INFO")
 
   async def stop(self):
-    """엔진 종료 신호 설정 (기존과 동일)"""
+    """엔진 종료 신호 설정"""
     if not self._stop_event.is_set():
         self.add_log("⏹️ 엔진 종료 신호 수신...", level="WARNING") 
         self._stop_event.set()
@@ -151,16 +201,17 @@ class TradingEngine:
   async def shutdown(self):
     """엔진 리소스 정리"""
     self.add_log("🛑 엔진 종료(Shutdown) 절차 시작...", level="INFO") 
+    self.engine_status = "STOPPING"
+    
     if self.api and self.subscribed_codes:
         self.add_log("  -> [Shutdown] 실시간 구독 해지 시도...", level="DEBUG") 
         codes_to_remove = list(self.subscribed_codes)
-        # ✅ '1h'도 종목코드(tr_key)가 필요한 TR로 가정
+        
         tr_ids = ['0B', '0D', '1h'] * len(codes_to_remove)
         tr_keys = [code for code in codes_to_remove for _ in range(3)]
         
-        # 기본 TR('00', '04')도 해지 (키움 API 정책에 따라 필요 없을 수 있음)
         tr_ids.extend(['00', '04'])
-        tr_keys.extend(["", ""]) # 기본 TR은 tr_key가 ""
+        tr_keys.extend(["", ""]) 
         
         try:
             await self.api.unregister_realtime(tr_ids=tr_ids, tr_keys=tr_keys)
@@ -176,6 +227,7 @@ class TradingEngine:
         self.add_log("  -> [Shutdown] HTTP 클라이언트 세션 종료 시도...", level="DEBUG") 
         await self.api.close()
         self.add_log("  ✅ [Shutdown] API 리소스 정리 완료.", level="INFO") 
+        self.api = None 
     else:
         self.add_log("  ⚠️ [Shutdown] API 객체가 없어 정리 스킵.", level="WARNING") 
 
@@ -192,13 +244,13 @@ class TradingEngine:
             'mrkt_tp': '000', # 000: 전체, 001: 코스피, 101: 코스닥
             'sort_tp': '2',   # 1: 급증량, 2: 급증률
             'tm_tp': '1',     # 1: 분, 2: 전일
-            'tm': str(self.config.strategy.screening_surge_timeframe_minutes), # 비교 시간(분)
-            'trde_qty_tp': str(self.config.strategy.screening_min_volume_threshold * 10000).zfill(4) if self.config.strategy.screening_min_volume_threshold > 0 else '0000', # 최소 거래량 (만주 -> 주 변환 및 4자리 맞춤)
+            'tm': str(self.screening_surge_timeframe_minutes), # 비교 시간(분)
+            'trde_qty_tp': str(self.screening_min_volume_threshold * 10000).zfill(4) if self.screening_min_volume_threshold > 0 else '0000', # 최소 거래량 (만주 -> 주 변환 및 4자리 맞춤)
             'stk_cnd': '14',  # 0: 전체, 1: 관리제외, 14: ETF/ETN 제외 (API 문서 확인하여 적절한 코드 사용)
             'pric_tp': '8',   # 0: 전체, 8: 1천원 이상 (config 연동)
             'stex_tp': '3'    # 1: KRX, 2: NXT, 3: 통합
         }
-        if self.config.strategy.screening_min_price >= 1000: params['pric_tp'] = '8' 
+        if self.screening_min_price >= 1000: params['pric_tp'] = '8' 
         else: params['pric_tp'] = '0' 
 
         self.add_log(f"   [SCREEN] API 요청 파라미터: {params}", level="DEBUG") 
@@ -225,9 +277,9 @@ class TradingEngine:
                     current_price = int(current_price_str) if current_price_str else 0
                     volume = int(volume_str) if volume_str else 0
 
-                    if (surge_rate >= self.config.strategy.screening_min_surge_rate and
-                        current_price >= self.config.strategy.screening_min_price and
-                        volume >= self.config.strategy.screening_min_volume_threshold * 10000): 
+                    if (surge_rate >= self.screening_min_surge_rate and
+                        current_price >= self.screening_min_price and
+                        volume >= self.screening_min_volume_threshold * 10000): 
                         potential_targets.append({'code': code, 'name': name, 'surge_rate': surge_rate})
                 except (ValueError, TypeError) as parse_e:
                     self.add_log(f"   ⚠️ [SCREEN] 데이터 파싱 오류: {parse_e}, Item: {item}", level="WARNING") 
@@ -235,8 +287,7 @@ class TradingEngine:
 
             potential_targets.sort(key=lambda x: x['surge_rate'], reverse=True)
             
-            # ❗️ 수정: new_targets를 self.target_stocks에 할당
-            new_targets = {item['code'] for item in potential_targets[:self.config.strategy.max_target_stocks]}
+            new_targets = {item['code'] for item in potential_targets[:self.max_target_stocks]}
             self.target_stocks = new_targets # 감시 대상 목록 자체를 업데이트
 
             # --- 실시간 구독 관리 ---
@@ -301,7 +352,6 @@ class TradingEngine:
             self.vi_status.pop(code, None)
             self.ohlcv_data.pop(code, None) # ❗️ 차트 데이터도 제거
             self.current_candle.pop(code, None) # ❗️ 집계 중인 캔들도 제거
-  # --- 👆 _update_realtime_subscriptions 함수 수정 끝 ---
 
   async def _initialize_stock_data(self, stock_code: str):
     """(1회성) 1분봉 차트 이력을 조회하여 ohlcv_data에 저장"""
@@ -360,7 +410,7 @@ class TradingEngine:
     return is_active
 
   def calculate_order_quantity(self, stock_code: str, current_price: float) -> int:
-    investment_amount = self.config.strategy.investment_amount_per_stock
+    investment_amount = self.investment_amount_per_stock
     if current_price <= 0:
         self.add_log(f"   ⚠️ [{stock_code}] 주문 수량 계산 불가: 현재가({current_price}) <= 0", level="WARNING") 
         return 0
@@ -537,7 +587,7 @@ class TradingEngine:
             total_ask_vol = int(orderbook_ws_data.get('total_ask_vol', 0))
             total_bid_vol = int(orderbook_ws_data.get('total_bid_vol', 0))
         
-        # --- [수정] 지표 계산 시 self의 동적 설정값 사용 ---
+        # --- 지표 계산 시 self의 동적 설정값 사용 ---
         add_vwap(df)
         add_ema(df, short_period=self.config.strategy.ema_short_period, long_period=self.config.strategy.ema_long_period)
         
@@ -579,13 +629,9 @@ class TradingEngine:
                 self.add_log(f"   ⚠️ [{stock_code}] VI 발동 중. 신규 진입 보류.", level="INFO") 
                 return
 
-            # --- 👇 [수정] check_breakout_signal 호출 시 self.breakout_buffer 전달 ---
-            # ❗️ (기존) signal = check_breakout_signal(df, orb_levels) 
-            # ❗️ (수정) momentum_orb.py의 원본 시그니처에 맞게 수정
             signal = check_breakout_signal(current_price, orb_levels, self.breakout_buffer) 
-            # --- 👆 [수정] ---
             
-            # ❗️ [임시 수정] RVOL 필터 비활성화 (기존과 동일)
+            # ❗️ RVOL 필터 비활성화
             rvol_ok = True 
             obi_ok = obi is not None and obi >= self.config.strategy.obi_threshold
             strength_ok = strength_val is not None and strength_val >= self.config.strategy.strength_threshold
@@ -607,7 +653,7 @@ class TradingEngine:
                         if order_result and order_result.get('return_code') == 0:
                             order_no = order_result.get('ord_no')
                             
-                            # --- 👇 [수정] 포지션 생성 시 현재 엔진의 설정값을 복사/저장 ---
+                            # --- 👇 포지션 생성 시 현재 엔진의 설정값을 복사/저장 ---
                             self.positions[stock_code] = {
                                 'stk_cd': stock_code, 'entry_price': None, 'size': order_qty, 
                                 'status': 'PENDING_ENTRY', 'order_no': order_no,
@@ -618,7 +664,6 @@ class TradingEngine:
                                 'partial_profit_pct': self.partial_take_profit_pct,
                                 'partial_profit_ratio': self.partial_take_profit_ratio 
                             }
-                            # --- 👆 [수정] ---
                             
                             self.add_log(f"   ➡️ [{stock_code}] 매수 주문 접수 완료: {order_no}", level="INFO") 
                         else:
@@ -634,10 +679,7 @@ class TradingEngine:
                 exit_signal = "VI_STOP"
                 self.add_log(f"   🚨 [{stock_code}] VI 발동 감지! 강제 청산 시도.", level="WARNING") 
             else:
-                # --- 👇 [수정] manage_position 호출 시그니처 변경 없음 ---
-                # (risk_manager가 position_info에서 값을 읽도록 수정했기 때문)
                 exit_signal = manage_position(position_info, df) 
-                # --- 👆 [수정] ---
 
                 TIME_STOP_HOUR = self.config.strategy.time_stop_hour; TIME_STOP_MINUTE = self.config.strategy.time_stop_minute
                 now_kst = datetime.now().astimezone() 
@@ -648,12 +690,10 @@ class TradingEngine:
             # 부분 익절
             if exit_signal == "PARTIAL_TAKE_PROFIT" and not position_info.get('partial_profit_taken', False):
                 current_size = position_info.get('size', 0)
-                # ❗️ [수정] config 대신 position_info에 저장된 ratio 사용
                 partial_ratio = position_info.get('partial_profit_ratio', self.config.strategy.partial_take_profit_ratio)
                 size_to_sell = math.ceil(current_size * partial_ratio) 
 
                 if size_to_sell > 0 and size_to_sell < current_size :
-                    # ... (이하 부분 익절 로직 동일) ...
                     self.add_log(f"💰 [{stock_code}] 부분 익절 실행 ({partial_ratio*100:.0f}%): {size_to_sell}주 매도 시도", level="INFO") 
                     order_result = await self.api.create_sell_order(stock_code, size_to_sell) 
 

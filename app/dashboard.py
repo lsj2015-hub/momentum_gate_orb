@@ -87,63 +87,142 @@ def stop_engine_background():
         except Exception as e: st.error(f"엔진 종료 중 예상치 못한 오류: {e}")
 
 
-# --- 👇 [신규] 사이드바: 전략 설정 ---
+# --- 👇 사이드바: 전략 설정 ---
 st.sidebar.header("⚙️ Strategy Settings (실시간 적용)")
-st.sidebar.warning("설정 변경 후 'Apply Settings' 버튼을 눌러야 엔진에 반영됩니다. 반영된 설정은 **다음 신규 진입**부터 적용됩니다.")
+st.sidebar.warning("설정 변경 후 'Apply Settings' 버튼을 눌러야 엔진에 반영됩니다. 반영된 설정은 **다음 신규 진입/스크리닝**부터 적용됩니다.")
 
-# 엔진 객체가 초기화된 후에만 위젯 생성
 if engine:
-    # ORB 설정
-    orb_tf = st.sidebar.slider(
-        "ORB Timeframe (minutes)",
-        min_value=5,
-        max_value=60,
-        value=engine.orb_timeframe, # 기본값: 엔진의 현재 설정값
-        step=5,
-        help="Opening Range Breakout (시가 돌파) 범위를 계산할 개장 후 시간(분)입니다. 예: 15분이면 9시부터 9시 15분까지의 고가/저가를 기준으로 사용합니다."
-    )
+    # --- 탭(Tabs)을 사용하여 설정 구분 ---
+    tab1, tab2, tab3 = st.sidebar.tabs(["📈 진입/청산", "💰 자금 관리", "🔍 스크리닝"])
 
-    # 돌파 버퍼 설정
-    breakout_buf = st.sidebar.number_input(
-        "Breakout Buffer (%)",
-        min_value=0.0,
-        max_value=5.0,
-        value=engine.breakout_buffer, # 기본값: 엔진의 현재 설정값
-        step=0.05,
-        format="%.2f",
-        help="ORB 고가(ORH)를 돌파했다고 판단하기 위한 추가 버퍼 비율(%)입니다. 예: 0.15%면 ORB 고가보다 0.15% 높은 가격에서 매수 신호를 발생시킵니다."
-    )
+    with tab1:
+        st.markdown("#### 진입 및 청산 조건")
+        orb_tf = st.slider(
+            "ORB Timeframe (minutes)",
+            min_value=5,
+            max_value=60,
+            value=engine.orb_timeframe, 
+            step=5,
+            help="ORB(시가 돌파) 범위를 계산할 개장 후 시간(분)입니다. [기본값: 15]"
+        )
+        breakout_buf = st.number_input(
+            "Breakout Buffer (%)",
+            min_value=0.0,
+            max_value=5.0,
+            value=engine.breakout_buffer, 
+            step=0.05,
+            format="%.2f",
+            help="ORB 고가(ORH)를 돌파했다고 판단하기 위한 추가 버퍼(%)입니다. [기본값: 0.15]"
+        )
+        tp_pct = st.number_input(
+            "Take Profit (%)",
+            min_value=0.1,
+            max_value=20.0, 
+            value=engine.take_profit_pct, 
+            step=0.1,
+            format="%.2f",
+            help="포지션 진입 가격 대비 목표 익절 수익률(%)입니다. [기본값: 2.5]"
+        )
+        sl_pct = st.number_input(
+            "Stop Loss (%)",
+            min_value=-20.0, 
+            max_value=-0.1, 
+            value=engine.stop_loss_pct, 
+            step=-0.1, 
+            format="%.2f",
+            help="포지션 진입 가격 대비 허용 손실률(%)입니다. (음수) [기본값: -1.0]"
+        )
 
-    # 익절 설정
-    tp_pct = st.sidebar.number_input(
-        "Take Profit (%)",
-        min_value=0.1,
-        max_value=20.0, # 최대값 상향
-        value=engine.take_profit_pct, # 기본값: 엔진의 현재 설정값
-        step=0.1,
-        format="%.2f",
-        help="포지션 진입 가격 대비 목표 익절 수익률(%)입니다."
-    )
+    with tab2:
+        st.markdown("#### 자금 및 포지션 관리")
+        invest_amt = st.number_input(
+            "종목당 투자 금액 (원)",
+            min_value=50000,
+            max_value=10000000, # 최대 1천만원 (필요시 조정)
+            value=engine.investment_amount_per_stock,
+            step=50000,
+            help=f"한 종목 신규 진입 시 사용할 고정 투자 금액(원)입니다. [기본값: {config.strategy.investment_amount_per_stock}]"
+        )
+        max_pos = st.slider(
+            "최대 동시 보유 종목 수",
+            min_value=1,
+            max_value=20,
+            value=engine.max_concurrent_positions,
+            step=1,
+            help=f"동시에 'IN_POSITION' 상태로 보유할 수 있는 최대 종목 수입니다. [기본값: {config.strategy.max_concurrent_positions}]"
+        )
 
-    # 손절 설정
-    sl_pct = st.sidebar.number_input(
-        "Stop Loss (%)",
-        min_value=-20.0, # 최소값 하향
-        max_value=-0.1, # 손절은 음수 값
-        value=engine.stop_loss_pct, # 기본값: 엔진의 현재 설정값
-        step=-0.1, # 음수 방향으로 조절
-        format="%.2f",
-        help="포지션 진입 가격 대비 허용 손실률(%)입니다. 반드시 음수 값이어야 합니다."
-    )
+    with tab3:
+        st.markdown("#### 스크리닝 (종목 탐색) 조건")
+        max_targets = st.slider(
+            "최대 스크리닝 후보 수",
+            min_value=1,
+            max_value=20,
+            value=engine.max_target_stocks,
+            step=1,
+            help=f"스크리닝 결과에서 상위 N개의 종목만 실시간 감시 대상으로 등록합니다. [기본값: {config.strategy.max_target_stocks}]"
+        )
+        screen_interval = st.slider(
+            "스크리닝 주기 (분)",
+            min_value=1,
+            max_value=60,
+            value=engine.screening_interval_minutes,
+            step=1,
+            help=f"새로운 종목을 탐색하는 스크리닝 로직의 실행 주기(분)입니다. [기본값: {config.strategy.screening_interval_minutes}]"
+        )
+        screen_surge_time = st.slider(
+            "거래량 급증 비교 시간 (분)",
+            min_value=1,
+            max_value=30,
+            value=engine.screening_surge_timeframe_minutes,
+            step=1,
+            help=f"거래량 급증률 계산 시 비교할 시간(N분 전 대비)입니다. [기본값: {config.strategy.screening_surge_timeframe_minutes}]"
+        )
+        screen_min_vol = st.number_input(
+            "최소 거래량 기준 (만 주)",
+            min_value=0,
+            max_value=1000,
+            value=engine.screening_min_volume_threshold,
+            step=10,
+            help=f"스크리닝 시 최소 거래량 조건 (단위: 만 주). 예: 10 -> 100,000주 [기본값: {config.strategy.screening_min_volume_threshold}]"
+        )
+        screen_min_price = st.number_input(
+            "최소 가격 기준 (원)",
+            min_value=100,
+            max_value=50000,
+            value=engine.screening_min_price,
+            step=100,
+            help=f"스크리닝 시 최소 주가 조건 (원). [기본값: {config.strategy.screening_min_price}]"
+        )
+        screen_min_surge = st.number_input(
+            "최소 거래량 급증률 (%)",
+            min_value=50.0,
+            max_value=1000.0,
+            value=engine.screening_min_surge_rate,
+            step=10.0,
+            format="%.1f",
+            help=f"스크리닝 시 N분 전 대비 최소 거래량 급증률(%) 조건. [기본값: {config.strategy.screening_min_surge_rate}]"
+        )
 
-    # 설정값 업데이트 버튼
+    # 설정값 업데이트 버튼 (탭 밖에 위치)
     if st.sidebar.button("Apply Settings"):
         try:
             engine.update_strategy_settings({
+                # Tab 1
                 'orb_timeframe': orb_tf,
                 'breakout_buffer': breakout_buf,
                 'take_profit_pct': tp_pct,
-                'stop_loss_pct': sl_pct
+                'stop_loss_pct': sl_pct,
+                # Tab 2
+                'investment_amount_per_stock': invest_amt,
+                'max_concurrent_positions': max_pos,
+                # Tab 3
+                'max_target_stocks': max_targets,
+                'screening_interval_minutes': screen_interval,
+                'screening_surge_timeframe_minutes': screen_surge_time,
+                'screening_min_volume_threshold': screen_min_vol,
+                'screening_min_price': screen_min_price,
+                'screening_min_surge_rate': screen_min_surge,
             })
             st.sidebar.success("✅ 설정이 엔진에 반영되었습니다!")
             st.rerun() # 설정 적용 후 화면 즉시 갱신
@@ -151,8 +230,7 @@ if engine:
             st.sidebar.error(f"설정 적용 실패: {e}")
 else:
     st.sidebar.error("엔진이 초기화되지 않아 설정을 표시할 수 없습니다.")
-# --- 👆 [신규] 사이드바 끝 ---
-
+# --- 👆 사이드바 끝 ---
 
 # --- 제목 및 UI ---
 st.title("🤖 Momentum Gate ORB Trading Bot")
@@ -206,15 +284,22 @@ with col1:
 
   st.markdown("---")
   
-  # --- 👇 [신규] 현재 적용 중인 전략 설정 표시 ---
-  st.markdown("##### **현재 전략 설정 (신규 진입 시 적용)**")
+  # --- 👇 현재 설정 표시 (두 섹션으로 분리) ---
+  st.markdown("##### **Current Strategy (Entry/Exit)**")
   if engine:
-      st.markdown(f"- ORB Timeframe: **{engine.orb_timeframe} 분**")
-      st.markdown(f"- Breakout Buffer: **{engine.breakout_buffer:.2f} %**")
-      st.markdown(f"- Take Profit: **{engine.take_profit_pct:.2f} %**")
-      st.markdown(f"- Stop Loss: **{engine.stop_loss_pct:.2f} %**")
-  # --- 👆 [신규] ---
+      st.markdown(f"- ORB Timeframe: **{engine.orb_timeframe} 분** | Buffer: **{engine.breakout_buffer:.2f} %**")
+      st.markdown(f"- Take Profit: **{engine.take_profit_pct:.2f} %** | Stop Loss: **{engine.stop_loss_pct:.2f} %**")
 
+  st.markdown("##### **Current Screening & Capital**")
+  if engine:
+      st.markdown(f"- 투자금(종목당): **{engine.investment_amount_per_stock:,} 원**")
+      st.markdown(f"- 최대 보유: **{engine.max_concurrent_positions} 종목** | 최대 후보: **{engine.max_target_stocks} 종목**")
+      st.markdown(f"- 스크리닝 주기: **{engine.screening_interval_minutes} 분**")
+      st.markdown(f"<small>  (조건) 급증시간: {engine.screening_surge_timeframe_minutes}분 | "
+                  f"최소거래(만): {engine.screening_min_volume_threshold} | "
+                  f"최소가: {engine.screening_min_price}원 | "
+                  f"최소급증률: {engine.screening_min_surge_rate:.1f}%</small>", unsafe_allow_html=True)
+      
   st.markdown("##### **스크리닝 후보 종목**")
   if hasattr(engine, 'candidate_stocks_info') and engine.candidate_stocks_info:
     display_candidates = [f"{info['stk_cd']} ({info['stk_nm']})" for info in engine.candidate_stocks_info]
@@ -259,12 +344,6 @@ st.divider()
 
 st.subheader("📝 Trading Logs")
 log_list = getattr(engine, 'logs', ["엔진 로그를 가져올 수 없습니다."])
-
-# --- 👇 [수정] 디버깅 코드 제거 (또는 주석 처리) ---
-# st.write(f"--- DEBUG: 현재 로그 개수: {len(log_list)} ---")
-# if log_list:
-#     st.write(f"--- DEBUG: 최신 로그 샘플: {log_list[0][:100]}... ---")
-# --- 👆 [수정] ---
 
 log_text = "\n".join(log_list)
 st.text_area("Logs", value=log_text, height=300, disabled=True, key="log_area") 
