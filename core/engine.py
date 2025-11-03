@@ -44,6 +44,7 @@ class TradingEngine:
     # 2. 현재 집계 중인 1분봉 캔들 (Dict)
     self.current_candle: Dict[str, Dict[str, Any]] = {} # {'종목코드': {'time': ..., 'open': ..., 'high': ..., 'low': ..., 'close': ..., 'volume': ...}}
     # ---
+    self.orb_levels: Dict[str, Dict] = {} # {'종목코드': {'orh': 10000, 'orl': 9000}}
     
     self.realtime_data: Dict[str, Dict] = {} 
     self.orderbook_data: Dict[str, Dict] = {} 
@@ -472,7 +473,7 @@ class TradingEngine:
         logger.exception(e) 
 
   async def _process_realtime_execution(self, stock_code: str, values: Dict):
-    """실시간 체결(0B) 처리: 1분봉 캔들 집계 및 체결강도 누적"""
+    """실시간 체결(0B) 처리: [틱 단위 매수 신호 판단] + 1분봉 캔들 집계 및 체결강도 누적"""
     try:
         last_price_str = values.get('10') # 현재가
         exec_vol_signed_str = values.get('15') # 거래량 (+/- 포함)
@@ -511,7 +512,108 @@ class TradingEngine:
         elif exec_vol_signed < 0: current_cumulative['sell_vol'] += abs(exec_vol_signed)
         current_cumulative['timestamp'] = current_time.replace(tzinfo=None)
         
-        # 3. --- [신규] 1분봉 캔들 집계 ---
+        # --- 실시간(틱) 매수 신호 판단 로직 ---
+        position_info = self.positions.get(stock_code)
+        
+        # 1. 포지션이 없고 (CLOSED 포함),
+        if (not position_info or position_info.get('status') == 'CLOSED'):
+            
+            # 2. 저장된 ORB 레벨을 불러옴
+            current_orb_levels_dict = self.orb_levels.get(stock_code)
+            
+            # 3. ORB 레벨이 계산되었고 (e.g., 9시 15분 이후),
+            if current_orb_levels_dict and current_orb_levels_dict.get('orh') is not None:
+                
+                # 4. 실시간 가격(last_price)으로 돌파 신호 확인
+                orb_series_for_check = pd.Series(current_orb_levels_dict) # check_breakout_signal 호환용
+                signal = check_breakout_signal(last_price, orb_series_for_check, self.breakout_buffer)
+                
+                if signal == "BUY":
+                    # 5. VI 발동, OBI, Strength 등 실시간 필터 확인
+                    if self.check_vi_status(stock_code):
+                        self.add_log(f"   ⚠️ [{stock_code}] 실시간 돌파(틱) 감지! VI 발동 중. 진입 보류.", level="INFO")
+                        return # 틱 처리 중단 (캔들 집계도 스킵)
+
+                    # OBI 필터 (실시간)
+                    orderbook_ws_data = self.orderbook_data.get(stock_code)
+                    obi_ok = False
+                    if orderbook_ws_data:
+                        total_ask_vol = int(orderbook_ws_data.get('total_ask_vol', 0))
+                        total_bid_vol = int(orderbook_ws_data.get('total_bid_vol', 0))
+                        obi = calculate_obi(total_bid_vol, total_ask_vol)
+                        if obi is not None and obi >= self.config.strategy.obi_threshold:
+                            obi_ok = True
+                    
+                    # 체결강도 필터 (실시간 누적)
+                    cumulative_vols = self.cumulative_volumes.get(stock_code)
+                    strength_ok = False
+                    if cumulative_vols:
+                        strength_val = get_strength(cumulative_vols['buy_vol'], cumulative_vols['sell_vol'])
+                        if strength_val is not None and strength_val >= self.config.strategy.strength_threshold:
+                            strength_ok = True
+                    
+                    # --- 1분봉 마감 기준 지표 (Momentum Gate) 확인 ---
+                    df = self.ohlcv_data.get(stock_code)
+                    # ❗️ RVOL 필터는 원본 코드(engine.py, line 351)에서 비활성화(True) 되어 있었으므로, 동일하게 적용합니다.
+                    rvol_ok = True 
+                    momentum_ok = False
+
+                    if df is not None and not df.empty:
+                        last_candle = df.iloc[-1]
+                        
+                        # 1. RVOL 확인 (현재 비활성화됨)
+                        # rvol_period = self.config.strategy.rvol_period
+                        # rvol_val = calculate_rvol(df, window=rvol_period) 
+                        # if rvol_val is not None and rvol_val >= self.config.strategy.rvol_threshold:
+                        #     rvol_ok = True
+                            
+                        # 2. EMA 정배열 확인
+                        ema_short_col = f'EMA_{self.config.strategy.ema_short_period}'
+                        ema_long_col = f'EMA_{self.config.strategy.ema_long_period}'
+                        
+                        if ema_short_col in last_candle and ema_long_col in last_candle:
+                            ema_short_val = last_candle[ema_short_col]
+                            ema_long_val = last_candle[ema_long_col]
+                            if not pd.isna(ema_short_val) and not pd.isna(ema_long_val) and ema_short_val > ema_long_val:
+                                momentum_ok = True
+                    
+                    # --- ❗️[수정]❗️ 모든 필터(Gate)를 통과했는지 확인 ---
+                    if obi_ok and strength_ok and rvol_ok and momentum_ok:
+                        # 6. 최대 보유 종목 수 확인 (PENDING_ENTRY 포함)
+                        if len([p for p in self.positions.values() if p.get('status') in ['IN_POSITION', 'PENDING_ENTRY']]) >= self.max_concurrent_positions:
+                            self.add_log(f"   ⚠️ [{stock_code}] 실시간 돌파(틱) 감지! 최대 보유 종목 수({self.max_concurrent_positions}) 도달. 진입 보류.", level="WARNING")
+                            return # 틱 처리 중단 (캔들 집계도 스킵)
+
+                        # 7. 주문 수량 계산 및 주문
+                        order_qty = self.calculate_order_quantity(stock_code, last_price)
+                        if order_qty > 0:
+                            self.add_log(f"🔥 [{stock_code}] 실시간(틱) 돌파 감지! {order_qty}주 시장가 매수 주문 시도...", level="INFO")
+                            
+                            order_result = await self.api.create_buy_order(stock_code, order_qty)
+                            if order_result and order_result.get('return_code') == 0:
+                                order_no = order_result.get('ord_no')
+                                # 포지션 상태를 'PENDING_ENTRY'로 설정하여 중복 주문 방지
+                                self.positions[stock_code] = {
+                                    'stk_cd': stock_code, 'entry_price': None, 'size': order_qty, 
+                                    'status': 'PENDING_ENTRY', 'order_no': order_no,
+                                    'entry_time': None, 'partial_profit_taken': False,
+                                    # ❗️ 현재 엔진의 동적 설정값을 이 포지션에 '고정'
+                                    'target_profit_pct': self.take_profit_pct, 
+                                    'stop_loss_pct': self.stop_loss_pct,       
+                                    'partial_profit_pct': self.partial_take_profit_pct,
+                                    'partial_profit_ratio': self.partial_take_profit_ratio 
+                                }
+                                self.add_log(f"   ➡️ [{stock_code}] (틱) 매수 주문 접수 완료: {order_no}", level="INFO")
+                            else:
+                                error_msg = order_result.get('return_msg', '주문 실패') if order_result else 'API 호출 실패'
+                                self.add_log(f"   ❌ [{stock_code}] (틱) 매수 주문 실패: {error_msg}", level="ERROR")
+                    else:
+                         # ❗️[수정]❗️ 필터 로그 상세화
+                         filter_log = f"OBI:{obi_ok}, Strength:{strength_ok}, RVOL:{rvol_ok}, Momentum:{momentum_ok}"
+                         self.add_log(f"   ⚠️ [{stock_code}] (틱) 돌파 감지했으나 '모멘텀 게이트' 미충족 ({filter_log}). 진입 보류.", level="DEBUG")
+        # --- 👆 [신규] 실시간(틱) 매수 신호 판단 로직 끝 ---
+        
+        # 3. --- [기존] 1분봉 캔들 집계 (이 로직은 신규 로직 뒤에 그대로 둡니다) ---
         current_minute = current_time.replace(second=0, microsecond=0) # 현재 캔들의 분(minute)
         
         if stock_code not in self.current_candle or not self.current_candle[stock_code]:
@@ -556,12 +658,12 @@ class TradingEngine:
         self.add_log(f"  🚨 [RT_EXEC] ({stock_code}) 데이터 처리 오류: {e}, Data: {values}", level="ERROR") 
     except Exception as e:
         self.add_log(f"  🚨 [RT_EXEC] ({stock_code}) 예상치 못한 오류: {e}", level="ERROR") 
-        logger.exception(e) 
+        logger.exception(e)
 
   async def _handle_new_candle(self, stock_code: str, completed_candle: Dict[str, Any]):
     """
     완성된 1분봉 캔들을 받아 DataFrame에 추가하고, 
-    모든 지표 계산 및 매매 전략을 실행합니다.
+    [ORB 레벨 갱신] 및 [청산 전략]을 실행합니다. (매수 로직은 _process_realtime_execution으로 이동)
     """
     
     if stock_code not in self.ohlcv_data:
@@ -591,8 +693,10 @@ class TradingEngine:
         add_vwap(df)
         add_ema(df, short_period=self.config.strategy.ema_short_period, long_period=self.config.strategy.ema_long_period)
         
-        # ❗️ config.strategy.orb_timeframe 대신 self.orb_timeframe 사용
-        orb_levels = calculate_orb(df, timeframe=self.orb_timeframe)
+        orb_levels_series = calculate_orb(df, timeframe=self.orb_timeframe)
+        
+        # ❗️ 계산된 ORB 레벨을 엔진 변수에 저장
+        self.orb_levels[stock_code] = orb_levels_series.to_dict()
         
         rvol_period = self.config.strategy.rvol_period
         rvol = calculate_rvol(df, window=rvol_period)
@@ -605,13 +709,12 @@ class TradingEngine:
         if strength_val is not None: df.iloc[-1, df.columns.get_loc('strength')] = strength_val
         else: df.iloc[-1, df.columns.get_loc('strength')] = np.nan
         obi = calculate_obi(total_bid_vol, total_ask_vol)
-        # --- [수정] ---
 
-        if orb_levels['orh'] is None: self.add_log(f"  ⚠️ [{stock_code}] ORH 계산 불가 (데이터 부족?).", level="DEBUG"); return 
+        if orb_levels_series['orh'] is None: self.add_log(f"  ⚠️ [{stock_code}] ORH 계산 불가 (데이터 부족?).", level="DEBUG"); return 
 
         # ... (로그 출력 부분 동일) ...
-        orh_str = f"{orb_levels['orh']:.0f}" if orb_levels['orh'] is not None else "N/A"
-        orl_str = f"{orb_levels['orl']:.0f}" if orb_levels['orl'] is not None else "N/A"
+        orh_str = f"{orb_levels_series['orh']:.0f}" if orb_levels_series['orh'] is not None else "N/A"
+        orl_str = f"{orb_levels_series['orl']:.0f}" if orb_levels_series['orl'] is not None else "N/A"
         vwap_str = f"{df['vwap'].iloc[-1]:.0f}" if 'vwap' in df.columns and not pd.isna(df['vwap'].iloc[-1]) else "N/A"
         ema_short_col = f'EMA_{self.config.strategy.ema_short_period}'; ema_long_col = f'EMA_{self.config.strategy.ema_long_period}'
         ema9_str = f"{df[ema_short_col].iloc[-1]:.0f}" if ema_short_col in df.columns and not pd.isna(df[ema_short_col].iloc[-1]) else "N/A"
@@ -623,58 +726,12 @@ class TradingEngine:
 
         position_info = self.positions.get(stock_code)
 
-        # 5-1. 포지션 없을 때 (진입 시도)
+        # 5-1. 포지션 없을 때 (진입 시도) -> 로깅만 하도록 변경
         if not position_info or position_info.get('status') == 'CLOSED':
-            if self.check_vi_status(stock_code):
-                self.add_log(f"   ⚠️ [{stock_code}] VI 발동 중. 신규 진입 보류.", level="INFO") 
-                return
+             self.add_log(f"  ℹ️ [{stock_code}] 1분봉 완성. ORH:{orh_str} / ORL:{orl_str} 갱신. (틱 돌파 감시 중...)", level="DEBUG")
 
-            signal = check_breakout_signal(current_price, orb_levels, self.breakout_buffer) 
-            
-            # ❗️ RVOL 필터 비활성화
-            rvol_ok = True 
-            obi_ok = obi is not None and obi >= self.config.strategy.obi_threshold
-            strength_ok = strength_val is not None and strength_val >= self.config.strategy.strength_threshold
-            ema_short_val = df[ema_short_col].iloc[-1] if ema_short_col in df.columns and not pd.isna(df[ema_short_col].iloc[-1]) else None
-            ema_long_val = df[ema_long_col].iloc[-1] if ema_long_col in df.columns and not pd.isna(df[ema_long_col].iloc[-1]) else None
-            momentum_ok = ema_short_val is not None and ema_long_val is not None and ema_short_val > ema_long_val
-
-            if signal == "BUY":
-                if rvol_ok and obi_ok and strength_ok and momentum_ok:
-                    if len([p for p in self.positions.values() if p.get('status') == 'IN_POSITION']) >= self.config.strategy.max_concurrent_positions:
-                        self.add_log(f"   ⚠️ [{stock_code}] 최대 보유 종목 수({self.config.strategy.max_concurrent_positions}) 도달. 진입 보류.", level="WARNING") 
-                        return
-
-                    order_qty = self.calculate_order_quantity(stock_code, current_price)
-                    if order_qty > 0:
-                        self.add_log(f"🔥 [{stock_code}] 매수 조건 충족! {order_qty}주 시장가 매수 주문 시도...", level="INFO") 
-                        order_result = await self.api.create_buy_order(stock_code, order_qty)
-
-                        if order_result and order_result.get('return_code') == 0:
-                            order_no = order_result.get('ord_no')
-                            
-                            # --- 👇 포지션 생성 시 현재 엔진의 설정값을 복사/저장 ---
-                            self.positions[stock_code] = {
-                                'stk_cd': stock_code, 'entry_price': None, 'size': order_qty, 
-                                'status': 'PENDING_ENTRY', 'order_no': order_no,
-                                'entry_time': None, 'partial_profit_taken': False,
-                                # ❗️ 현재 엔진의 동적 설정값을 이 포지션에 '고정'시킴
-                                'target_profit_pct': self.take_profit_pct, 
-                                'stop_loss_pct': self.stop_loss_pct,       
-                                'partial_profit_pct': self.partial_take_profit_pct,
-                                'partial_profit_ratio': self.partial_take_profit_ratio 
-                            }
-                            
-                            self.add_log(f"   ➡️ [{stock_code}] 매수 주문 접수 완료: {order_no}", level="INFO") 
-                        else:
-                            error_msg = order_result.get('return_msg', '주문 실패') if order_result else 'API 호출 실패'
-                            self.add_log(f"   ❌ [{stock_code}] 매수 주문 실패: {error_msg}", level="ERROR") 
-                else:
-                    filter_log = f"RVOL:{rvol_ok}, OBI:{obi_ok}, Strength:{strength_ok}, Momentum:{momentum_ok}"
-                    self.add_log(f"   ⚠️ [{stock_code}] 매수 신호 발생했으나 필터 미충족 ({filter_log}). 진입 보류.", level="DEBUG") 
-
-        # 5-2. 포지션 있을 때 (청산 시도)
-        elif position_info.get('status') == 'IN_POSITION':
+        # 5-2. 포지션 있을 때 (청산 시도) -> ❗️[수정]❗️ 'elif'를 'if'로 변경
+        elif position_info and position_info.get('status') == 'IN_POSITION':
             if self.check_vi_status(stock_code):
                 exit_signal = "VI_STOP"
                 self.add_log(f"   🚨 [{stock_code}] VI 발동 감지! 강제 청산 시도.", level="WARNING") 
@@ -737,10 +794,11 @@ class TradingEngine:
                         self.add_log(f"❌ [{stock_code}] (전체) 청산 주문 실패: {error_msg}", level="ERROR") 
                         position_info['status'] = 'ERROR_EXIT_ORDER' 
 
-        elif position_info.get('status') == 'PENDING_ENTRY':
-            self.add_log(f"  ⏳ [{stock_code}] 매수 주문({position_info.get('order_no')}) 진행 중...", level="DEBUG") 
-        elif position_info.get('status') == 'PENDING_EXIT':
-            self.add_log(f"  ⏳ [{stock_code}] 매도 주문({position_info.get('order_no')}) 진행 중...", level="DEBUG") 
+        elif position_info and position_info.get('status') == 'PENDING_ENTRY':
+            self.add_log(f"  ⏳ [{stock_code}] 매수 주문({position_info.get('order_no')}) 진행 중... (1분봉 마감)", level="DEBUG") 
+        
+        elif position_info and position_info.get('status') == 'PENDING_EXIT':
+            self.add_log(f"  ⏳ [{stock_code}] 매도 주문({position_info.get('order_no')}) 진행 중... (1분봉 마감)", level="DEBUG") 
 
     except Exception as e:
         self.add_log(f"🚨 [CRITICAL] 캔들 핸들러({stock_code}) 오류: {e} 🚨", level="CRITICAL") 
@@ -773,7 +831,6 @@ class TradingEngine:
         self.add_log(f"  🚨 [RT_ORDERBOOK] ({stock_code}) 예상치 못한 오류: {e}", level="ERROR") 
         logger.exception(e) 
 
-  # --- _process_execution_update 함수 (기존과 동일) ---
   async def _process_execution_update(self, stock_code: Optional[str], values: Dict):
     stock_code_from_value = None 
     try:
@@ -851,6 +908,13 @@ class TradingEngine:
                         target_pos_info['status'] = 'CLOSED'
                         target_pos_info['order_no'] = None
                         self.add_log(f"🏁 [{target_pos_code}] 전체 청산 체결 업데이트 완료. 상태: {target_pos_info}", level="INFO") 
+
+                        try:
+                            with open("trades_history.jsonl", "a", encoding="utf-8") as f:
+                                f.write(json.dumps(target_pos_info, default=str) + "\n")
+                        except Exception as log_e:
+                            self.add_log(f"   ⚠️ [{target_pos_code}] 매매 이력 저장 실패: {log_e}", level="ERROR")
+                            
                     else: 
                         self.add_log(f"   ⏳ [{target_pos_code}] 전체 청산 진행 중... (체결:{target_pos_info['filled_qty']}/{target_pos_info.get('original_size_before_exit')})", level="DEBUG") 
 
